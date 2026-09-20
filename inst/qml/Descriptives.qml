@@ -766,6 +766,11 @@ Form
 							allowedColumns: 	["ordinal"]
 						}
 					}
+					CheckBox
+					{
+						name: "summaryOrdinalDisp"
+						label: qsTr("Show descriptives")
+					}
 				}
 
 				CheckBox

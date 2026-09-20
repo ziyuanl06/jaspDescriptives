@@ -351,6 +351,20 @@ DescriptivesInternal <- function(jaspResults, dataset, options) {
     .descriptivesSummaryNominal(jaspResults[["summaryPlotNominal"]], dataset, options)
   }
 
+  # Variable summary plots (ordinal)
+  if (options[["vSummaryPlot"]] && options[["vOrdinal"]]) {
+    if (is.null(jaspResults[["summaryPlotOrdinal"]])) {
+      jaspResults[["summaryPlotOrdinal"]] <- createJaspContainer(gettext("Variable Summary Plots (Ordinal)"))
+      jaspResults[["summaryPlotOrdinal"]]$dependOn(c(
+        "vSummaryPlot", "vOrdinal",
+        "summaryOrdinalDisp", "colorPalette", "quantilesType"
+      ))
+      jaspResults[["summaryPlotOrdinal"]]$position <- 19
+    }
+
+    .descriptivesSummaryOrdinal(jaspResults[["summaryPlotOrdinal"]], dataset, options)
+  }
+
   # Likert plots
   if (options[["likertPlot"]]) {
     if (is.null(jaspResults[["likertPlot"]])) {
@@ -2816,7 +2830,6 @@ DescriptivesInternal <- function(jaspResults, dataset, options) {
 }
 
 # Bar plot: one bar per level, frequency written above each bar
-# TODO: ggplot2 + jaspGraphs::themeJasp; Missing bar in gray; same level -> same color as in the stacked plot
 .descriptivesSummaryNominalBarPlot <- function(freqTable, options) {
   freqTable$level <- factor(freqTable$level, levels = freqTable$level)
   p <- ggplot2::ggplot(freqTable, ggplot2::aes(x = level, y = count, fill = level)) +
@@ -2877,11 +2890,6 @@ DescriptivesInternal <- function(jaspResults, dataset, options) {
   return(values)
 }
 
-# Stats panel shown to the right of the main plot (mimics Minitab's summary report, see EJ's screenshot)
-# TODO: an empty ggplot with annotate("text") for "label | value" and lines to separate the groups:
-#   group 1: total N, valid N, missing N
-#   group 2: valid proportion
-#   group 3: number of levels, mode (most frequent level) and its count
 .descriptivesSummaryNominalPanel <- function(variable, freqTable) {
   nTotal <- length(variable)
   nMissing <- sum(is.na(variable))
@@ -2916,6 +2924,149 @@ DescriptivesInternal <- function(jaspResults, dataset, options) {
   
   return(pPanel)
 }
+
+## Variable summary plots: ordinal -------------------------------------------------------------------------------------
+
+.descriptivesSummaryOrdinal <- function(container, dataset, options) {
+  variables <- unlist(options[["summaryPlotOrdinalVariablesSel"]])
+
+  # not ready to plot
+  if (length(variables) == 0)
+    return()
+
+
+  for (i in seq_along(variables)) {
+    variableName <- variables[[i]]
+
+
+    variable <- dataset[[variableName]]
+    freqTable <- .descriptivesSummaryOrdinalFreqTable(variable)
+
+    plot <- createJaspPlot(title = gettextf("Summary for %s", variableName), width = 720, height = 320, position = i)
+    plot$dependOn(optionContainsValue = list(summaryPlotOrdinalVariablesSel = variableName))
+    container[[variableName]] <- plot
+
+    errorMessage <- .descriptivesCheckPlotErrors(dataset, variableName, obsAmount = "< 1")
+
+    if (!is.null(errorMessage)){
+      plot$setError(errorMessage)
+      next
+    }
+    main <- .descriptivesSummaryOrdinalBarPlot(freqTable, options)
+      
+
+    if (options[["summaryOrdinalDisp"]]) {
+      panel <- .descriptivesSummaryOrdinalPanel(variable, freqTable, options)
+      main  <- patchwork::wrap_plots(main, panel, widths = c(3, 1))
+    }
+    plot$plotObject <- main
+
+  }
+}
+
+
+.descriptivesSummaryOrdinalFreqTable <- function(variable) {
+  freqOrdinal <- table(variable)
+
+  naCount <- sum(is.na(variable))
+  if (naCount > 0)
+    freqOrdinal[["Missing"]] <- naCount
+  
+  propOrdinal <- as.vector(freqOrdinal) / sum(as.vector(freqOrdinal))
+  freqOrdinalFrame <- data.frame(level = names(freqOrdinal), 
+                                 count = as.vector(unname(freqOrdinal)),
+                                 prop = as.vector(propOrdinal))
+
+  factor(freqOrdinalFrame$level, levels = freqOrdinalFrame$level)
+  
+  return(freqOrdinalFrame)
+}
+
+# Bar plot: one bar per level, frequency written above each bar
+.descriptivesSummaryOrdinalBarPlot <- function(freqTable, options) {
+  freqTable$level <- factor(freqTable$level, levels = freqTable$level)
+  p <- ggplot2::ggplot(freqTable, ggplot2::aes(x = level, y = count, fill = level)) +
+       ggplot2::geom_bar(stat = "identity", col = "black", width = 0.7, linewidth = .3) +
+       ggplot2::geom_text(ggplot2::aes(label = count), vjust = -0.5)
+
+  values <- .descriptivesSummaryOrdinalColors(freqTable, options)
+
+  p <- p + 
+       ggplot2::scale_fill_manual(values = values) + 
+       ggplot2::theme(legend.position = "none") +
+       jaspGraphs::geom_rangeframe() + 
+       jaspGraphs::themeJaspRaw() +
+       ggplot2::ylab(gettext("Frequency")) +
+       ggplot2::xlab(gettext("Level"))
+  
+  yBreaks <- jaspGraphs::getPrettyAxisBreaks(c(0, freqTable$count))
+  p <- p + 
+       ggplot2::scale_y_continuous(breaks = yBreaks, limits = range(yBreaks))
+
+  return(p)
+}
+
+
+
+.descriptivesSummaryOrdinalColors <- function(freqTable, options) {
+  levelNames <- as.character(freqTable$level)
+  realLevels <- setdiff(levelNames, "Missing")
+  nLevels    <- length(realLevels)
+
+  base   <- jaspGraphs::JASPcolors(options[["colorPalette"]])[1]
+  cols   <- grDevices::colorRampPalette(c("white", base))(nLevels + 2)[-(1:2)]
+  values <- stats::setNames(cols, realLevels)
+
+  if ("Missing" %in% levelNames)
+    values <- c(values, Missing = "grey")
+
+  return(values)
+}
+
+.descriptivesSummaryOrdinalPanel <- function(variable, freqTable, options) {
+  nTotal <- length(variable)
+  nMissing <- sum(is.na(variable))
+  nValid <- nTotal - nMissing
+  validTab <- freqTable[freqTable$level != "Missing", ]
+
+  modeIndex <- which.max(validTab$count)
+
+  qType       <- .ordinalQuantileType(as.integer(options[["quantilesType"]]))
+  ordQuantile <- function(p) as.character(quantile(na.omit(variable), p, names = FALSE, type = qType))
+
+  rows <- data.frame(
+    group = c(1, 1, 1, 2, 3, 3, 3, 4, 4, 4),
+    label = c(gettext("Total N"), gettext("Valid N"), gettext("Missing N"),
+              gettext("Valid %"),
+              gettext("Levels"), gettext("Mode"), gettext("Mode count"),
+              gettext("Median"), gettext("25% quantile"), gettext("75% quantile")),
+
+    value = c(nTotal, nValid, nMissing,
+              sprintf("%.1f%%", nValid / nTotal * 100),
+              nrow(validTab), as.character(validTab$level[modeIndex]), validTab$count[modeIndex],
+              ordQuantile(0.5), ordQuantile(0.25), ordQuantile(0.75)),
+    stringsAsFactors = FALSE
+  )
+
+  rows$y <- -(seq_len(nrow(rows)) + (rows$group - 1) * 0.6)
+
+  pPanel <- ggplot2::ggplot() +
+    ggplot2::geom_text(data = rows, ggplot2::aes(x = 0, y = y, label = label), hjust = 0, size = 3.5, fontface = "bold") +
+    ggplot2::geom_text(data = rows, ggplot2::aes(x = 1, y = y, label = value), hjust = 1, size = 3.5)
+
+  seps <- tapply(rows$y, rows$group, min)
+  seps <- seps[-length(seps)] - 0.6
+
+  pPanel <- pPanel +
+            ggplot2::geom_hline(yintercept = seps, linewidth = .3) +
+            ggplot2::scale_x_continuous(limits = c(-0.1, 1.1)) +
+            ggplot2::scale_y_continuous(limits = c(min(rows$y) - 0.7, max(rows$y) + 0.7)) +
+            ggplot2::theme_void() +
+            ggplot2::theme(panel.border = ggplot2::element_rect(colour = "black", fill = NA, linewidth = .3))
+
+  return(pPanel)
+}
+
 
 .geometricMean <- function(x) {
   if (any(x <= 0)) return(NA)
