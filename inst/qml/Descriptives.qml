@@ -735,10 +735,6 @@ Form
 							label: qsTr("Show descriptives")
 						}
 					}
-
-					
-
-
 				}
 
 				CheckBox
@@ -798,6 +794,70 @@ Form
 							allowedColumns: 	["scale"]
 						}
 					}
+
+					RadioButtonGroup
+					{
+						name: "summaryScaleMainType"
+						title: qsTr("Main plot")
+						RowLayout
+						{
+							spacing: 200
+							RadioButton 
+							{ 
+								value: "rain";		
+								label: qsTr("Raincloud");	
+								checked: true 
+
+								CheckBox
+								{
+									name: "summaryScaleRaindrops"
+									label: qsTr("Show raindrops")
+								}
+							}
+
+							RadioButton 
+							{ 
+								value: "hist";		
+								label: qsTr("Histogram") 
+
+								CheckBox
+								{
+									name: "summaryScaleDensline"
+									label: qsTr("Show density")
+								}
+							}
+						}
+						
+					}
+
+					Group
+					{
+						title: qsTr("Supplementary plots")
+						RowLayout
+						{
+							spacing: 260
+
+							CheckBox
+							{
+								name: "summaryScaleQQ"
+								label: qsTr("Q-Q plot")
+							}
+
+							CheckBox
+							{
+								name: "summaryScaleTimeSeries"
+								label: qsTr("Time series")
+							}
+						}
+					}
+
+					CheckBox
+					{
+						name: "summaryScaleNumbers"
+						label: qsTr("Show numbers")
+					}
+
+
 				}
 			}
 		}

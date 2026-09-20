@@ -365,6 +365,22 @@ DescriptivesInternal <- function(jaspResults, dataset, options) {
     .descriptivesSummaryOrdinal(jaspResults[["summaryPlotOrdinal"]], dataset, options)
   }
 
+  # Variable summary plots (scale)
+  if (options[["vSummaryPlot"]] && options[["vScale"]]) {
+    if (is.null(jaspResults[["summaryPlotScale"]])) {
+      jaspResults[["summaryPlotScale"]] <- createJaspContainer(gettext("Variable Summary Plots (Scale)"))
+      # NOTE: the variable box (summaryPlotScaleVariablesSel) is NOT listed here on purpose, every plot depends on its
+      #       own variable through optionContainsValue. quantilesType is needed for the median/quartiles.
+      jaspResults[["summaryPlotScale"]]$dependOn(c(
+        "vSummaryPlot", "vScale", "summaryScaleMainType", "summaryScaleRaindrops", "summaryScaleDensline",
+        "summaryScaleQQ", "summaryScaleTimeSeries", "summaryScaleNumbers", "colorPalette", "quantilesType"
+      ))
+      jaspResults[["summaryPlotScale"]]$position <- 20
+    }
+
+    .descriptivesSummaryScale(jaspResults[["summaryPlotScale"]], dataset, options)
+  }
+
   # Likert plots
   if (options[["likertPlot"]]) {
     if (is.null(jaspResults[["likertPlot"]])) {
@@ -2759,8 +2775,6 @@ DescriptivesInternal <- function(jaspResults, dataset, options) {
     return()
 
   # NOTE: like densityPlotSeparate, columns from any AssignedVariablesList are passed to R in `dataset`.
-  # TODO: check what the nominal columns look like when they arrive here (e.g. print(class(dataset[[variables[1]]]))
-  #       and check the JASP log): factor or something else? This affects table() and the sorting later.
 
   for (i in seq_along(variables)) {
     variableName <- variables[[i]]
@@ -3067,6 +3081,299 @@ DescriptivesInternal <- function(jaspResults, dataset, options) {
   return(pPanel)
 }
 
+
+## Variable summary plots: scale ----------------------------------------------------------------------------------------
+# Layout: raincloud (or histogram) is always the main plot, the supplementary panels are added around it:
+#   0 panels: main alone | 1 panel: side by side | 2 panels: main on top, two below | 3 panels: 2 x 2
+#   (2 x 2 order follows EJ's email: main, time series / QQ, numbers)
+# Every helper below is a placeholder that draws a labelled box, so the whole chain (options -> layout -> JASP) can be
+# tested first. Replace the placeholders one by one, then delete .descriptivesSummaryScalePlaceholder().
+
+.descriptivesSummaryScale <- function(container, dataset, options) {
+  variables <- unlist(options[["summaryPlotScaleVariablesSel"]])
+
+  # not ready to plot
+  if (length(variables) == 0)
+    return()
+
+  # which supplementary panels are switched on (the order is the reading order of the layout)
+  showPanels <- c(timeSeries = options[["summaryScaleTimeSeries"]],
+                  qq         = options[["summaryScaleQQ"]],
+                  numbers    = options[["summaryScaleNumbers"]])
+  size <- .descriptivesSummaryScaleSize(showPanels)
+
+  for (i in seq_along(variables)) {
+    variableName <- variables[[i]]
+
+    # NOTE: `variable` keeps its NAs, like in the nominal and ordinal blocks
+    variable <- dataset[[variableName]]
+
+    plot <- createJaspPlot(title = gettextf("Summary for %s", variableName),
+                           width = size[["width"]], height = size[["height"]], position = i)
+    plot$dependOn(optionContainsValue = list(summaryPlotScaleVariablesSel = variableName))
+    container[[variableName]] <- plot
+
+    # at least 2 valid observations: the density and the Q-Q plot need them
+    errorMessage <- .descriptivesCheckPlotErrors(dataset, variableName, obsAmount = "< 2")
+
+    if (!is.null(errorMessage)) {
+      plot$setError(errorMessage)
+      next
+    }
+
+    # main plot
+    main <- if (options[["summaryScaleMainType"]] == "rain") {
+      .descriptivesSummaryScaleRaincloud(variable, options)
+    } else {
+      .descriptivesSummaryScaleHistogram(variable, options)
+    }
+
+    # supplementary panels
+    panels <- list()
+    if (showPanels[["timeSeries"]]) panels[["timeSeries"]] <- .descriptivesSummaryScaleTimeSeries(variable, options)
+    if (showPanels[["qq"]])         panels[["qq"]]         <- .descriptivesSummaryScaleQQ(variable, options)
+    if (showPanels[["numbers"]])    panels[["numbers"]]    <- .descriptivesSummaryScalePanel(variable, options)
+
+    plot$plotObject <- .descriptivesSummaryScaleLayout(main, panels)
+  }
+}
+
+# Size of the JASP plot, depends on how many supplementary panels are shown
+# TODO: tune the numbers once the real plots exist
+.descriptivesSummaryScaleSize <- function(showPanels) {
+  nPanels <- sum(showPanels)
+  size <- switch(as.character(nPanels),
+                 "0" = c(width = 720, height = 240),
+                 "1" = c(width = 900, height = 320),
+                 "2" = c(width = 900, height = 600),
+                 c(width = 900, height = 640))
+
+  # one factor to make every layout smaller or larger without changing the proportions
+  sizeFactor <- 0.8
+
+  return(round(size * sizeFactor))
+}
+
+# Put the main plot and the panels together with patchwork
+# TODO: tune widths/heights; check the numbers panel (narrow) next to a wide plot
+.descriptivesSummaryScaleLayout <- function(main, panels) {
+  nPanels <- length(panels)
+
+  if (nPanels == 0)
+    return(main)
+
+  if (nPanels == 1) {
+    # the numbers panel is only a few lines of text, so it gets a narrow column
+    widths <- if (names(panels) == "numbers") c(3, 1.3) else c(1, 1)
+    return(patchwork::wrap_plots(main, panels[[1]], widths = widths))
+  }
+
+  if (nPanels == 2) {
+    below <- patchwork::wrap_plots(panels, ncol = 2)
+    return(patchwork::wrap_plots(main, below, ncol = 1))
+  }
+
+  # 3 panels: 2 x 2
+  patchwork::wrap_plots(c(list(main), panels), ncol = 2)
+}
+
+# Median, first and third quartile, written next to the box of the main plot
+
+.descriptivesSummaryScaleQuartiles <- function(variable, options) {
+  # same quantile type as the main table
+  q <- quantile(na.omit(variable), c(0.25, 0.5, 0.75), names = FALSE,
+                type = as.integer(options[["quantilesType"]]))
+
+  return(stats::setNames(q, c("q1", "median", "q3")))
+}
+
+# Raincloud plot: density "cloud" + box plot + (optional) raindrops
+.descriptivesSummaryScaleRaincloud <- function(variable, options) {
+  valid <- na.omit(variable)
+  df    <- data.frame(y = valid, x = factor(1))
+  q     <- .descriptivesSummaryScaleQuartiles(variable, options)
+  base  <- jaspGraphs::JASPcolors(options[["colorPalette"]])[1]
+
+  showDrops <- options[["summaryScaleRaindrops"]]
+
+  # the box is in the same color family as the cloud: a light tint inside, a darker shade for the outline
+  boxFill   <- grDevices::colorRampPalette(c(base, "white"))(11)[7]
+  boxColour <- grDevices::colorRampPalette(c(base, "black"))(11)[5]
+
+  # the box plot draws its own outliers only when the raindrops are off, otherwise every point is drawn twice
+  # (without raindrops and without outliers the extreme values would not be visible at all)
+  p <- ggplot2::ggplot(df, ggplot2::aes(x = x, y = y)) +
+    ggrain::geom_rain(
+      rain.side    = "r",
+      violin.args  = list(fill = base, alpha = .6, colour = "black", linewidth = .3),
+      # width = height of the cloud; the nudge is ggrain's default position, it is lost when only the width is given
+      violin.args.pos = list(width = 0.5, position = ggplot2::position_nudge(x = 0.15)),
+      boxplot.args = list(fill = boxFill, colour = boxColour, outlier.shape = if (showDrops) NA else 19, linewidth = .4),
+      point.args   = list(colour = base, alpha = if (showDrops) .6 else 0, size = 1.5))
+
+  labs <- data.frame(y = q, label = format(round(q, 2), nsmall = 2), face = c("plain", "bold", "plain"))
+  p <- p + ggplot2::geom_label(data = labs, ggplot2::aes(x = 1.2, y = y, label = label, fontface = face),
+                              size = 3.2, fill = "white", alpha = .8, linewidth = 0, inherit.aes = FALSE)
+
+  # breaks that cover the whole range of the data (after coord_flip() the values are still on the y scale)
+  yBreaks <- jaspGraphs::getPrettyAxisBreaks(valid)
+
+  # the small expansions matter: coord_flip(xlim) takes its padding from the scales, without them a big empty band
+  # appears under the raindrops
+  p <- p +
+    ggplot2::scale_x_discrete(expand = ggplot2::expansion(add = c(0.02, 0.02))) +
+    ggplot2::scale_y_continuous(breaks = yBreaks, limits = range(yBreaks), expand = ggplot2::expansion(mult = 0.02)) +
+    # lower limit: the space under the box is only needed for the raindrops
+    ggplot2::coord_flip(xlim = c(if (showDrops) 0.92 else 1.05, 1.4)) +
+    ggplot2::labs(x = NULL, y = NULL) +
+    jaspGraphs::geom_rangeframe(sides = "b") +
+    jaspGraphs::themeJaspRaw() +
+    ggplot2::theme(axis.text.y = ggplot2::element_blank(), axis.ticks.y = ggplot2::element_blank())
+
+  return(p)
+}
+
+# Histogram (Minitab style): histogram on top (optional density line), box plot below with the same x axis and
+# median / Q1 / Q3 written under the box
+.descriptivesSummaryScaleHistogram <- function(variable, options) {
+  valid  <- variable[!is.na(variable)]
+  base   <- jaspGraphs::JASPcolors(options[["colorPalette"]])[1]
+  q      <- .descriptivesSummaryScaleQuartiles(variable, options)
+  breaks <- jaspGraphs::getPrettyAxisBreaks(valid)
+
+  h <- jaspGraphs::jaspHistogram(valid, xName = "", binWidthType = "sturges",
+                                 density = options[["summaryScaleDensline"]], densityLineWidth = .8)
+  h$layers[[1]]$aes_params$fill   <- base
+  h$layers[[1]]$aes_params$alpha  <- .6
+  h$layers[[1]]$aes_params$colour <- "black"
+  h <- h +
+    ggplot2::scale_x_continuous(breaks = breaks, limits = range(breaks), expand = ggplot2::expansion(mult = 0.02)) +
+    ggplot2::theme(axis.title.x = ggplot2::element_blank())
+
+  iqr <- q[["q3"]] - q[["q1"]]
+  lo  <- min(valid[valid >= q[["q1"]] - 1.5 * iqr])
+  hi  <- max(valid[valid <= q[["q3"]] + 1.5 * iqr])
+  out <- data.frame(x = valid[valid < lo | valid > hi])
+  box <- data.frame(xmin = lo, xlower = q[["q1"]], xmiddle = q[["median"]],
+                    xupper = q[["q3"]], xmax = hi, y = 0)
+  labs <- data.frame(x = q, label = format(round(q, 2), nsmall = 2), face = c("plain", "bold", "plain"))
+
+  boxFill   <- grDevices::colorRampPalette(c(base, "white"))(11)[7]
+  boxColour <- grDevices::colorRampPalette(c(base, "black"))(11)[5]
+
+  b <- ggplot2::ggplot() +
+    ggplot2::geom_boxplot(data = box,
+                          ggplot2::aes(y = y, xmin = xmin, xlower = xlower, xmiddle = xmiddle, xupper = xupper, xmax = xmax),
+                          stat = "identity", orientation = "y", fill = boxFill, colour = boxColour,
+                          linewidth = .4, width = .5) +
+    ggplot2::geom_point(data = out, ggplot2::aes(x = x, y = 0), colour = boxColour, size = 1.2) +
+    ggplot2::geom_text(data = labs, ggplot2::aes(x = x, y = -0.42, label = label, fontface = face),
+                       size = 3.2, vjust = 1) +
+    ggplot2::scale_x_continuous(breaks = breaks, limits = range(breaks), expand = ggplot2::expansion(mult = 0.02)) +
+    ggplot2::scale_y_continuous(limits = c(-0.85, 0.35)) +
+    ggplot2::labs(x = NULL, y = NULL) +
+    jaspGraphs::themeJaspRaw() +
+    ggplot2::theme(axis.text.x = ggplot2::element_blank(), axis.text.y = ggplot2::element_blank(),
+                   axis.ticks.x = ggplot2::element_blank(), axis.ticks.y = ggplot2::element_blank(),
+                   axis.line.x = ggplot2::element_blank(), axis.line.y = ggplot2::element_blank())
+
+  return(patchwork::wrap_plots(h, b, ncol = 1, heights = c(4, 1.3)))
+}
+
+# Q-Q plot with a 95% CI band (always on)
+.descriptivesSummaryScaleQQ <- function(variable, options) {
+  z    <- as.numeric(scale(na.omit(variable)))
+  base <- jaspGraphs::JASPcolors(options[["colorPalette"]])[1]
+
+  jaspGraphs::plotQQnorm(z,
+                         yName = gettext("Sample quantiles"),
+                         ablineColor = "darkred",
+                         ablineOrigin = TRUE,
+                         identicalAxes = FALSE,
+                         ciLevel = 0.95,
+                         fillColor = base)
+}
+
+# Time series: the values plotted against the row order
+.descriptivesSummaryScaleTimeSeries <- function(variable, options) {
+  df <- data.frame(t = seq_along(variable), y = variable)
+  base <- jaspGraphs::JASPcolors(options[["colorPalette"]])[1]
+
+  p <- ggplot2::ggplot(df, ggplot2::aes(x = t, y = y)) +
+    ggplot2::geom_line(colour = base, linewidth = .4, na.rm = FALSE) +
+    ggplot2::geom_point(colour = base, size = 1, na.rm = TRUE)
+  
+  yBreaks <- jaspGraphs::getPrettyAxisBreaks(na.omit(variable))
+  tBreaks <- jaspGraphs::getPrettyAxisBreaks(df$t)
+
+  p <- p +  
+      ggplot2::scale_x_continuous(breaks = tBreaks, limits = range(tBreaks)) +
+      ggplot2::scale_y_continuous(breaks = yBreaks, limits = range(yBreaks)) +
+      ggplot2::labs(x = gettext("Observation (row order)"), y = NULL) +
+      jaspGraphs::geom_rangeframe() + jaspGraphs::themeJaspRaw()
+
+  return(p)
+}
+
+# Numbers panel, same look as the nominal and ordinal panels (median and quartiles are NOT here, they are on the box)
+
+.descriptivesSummaryScalePanel <- function(variable, options) {
+  valid    <- na.omit(variable)
+  nTotal   <- length(variable)
+  nValid   <- length(valid)
+  nMissing <- nTotal - nValid
+
+  # same quantile type as the main table
+  ordQuantile <- function(p) quantile(valid, p, names = FALSE, type = as.integer(options[["quantilesType"]]))
+
+  # 3 decimals like the main table; "-" when a statistic cannot be computed (e.g. kurtosis needs at least 4 values)
+  fmt <- function(x) if (is.finite(x)) sprintf("%.3f", x) else "-"
+
+  rows <- data.frame(
+    group = c(1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 4, 4, 4),
+    label = c(gettext("Total N"), gettext("Valid N"), gettext("Missing N"), gettext("Valid %"),
+              gettext("Mean"), gettext("Std. Deviation"),
+              gettext("Skewness"), gettext("Kurtosis"),
+              gettext("Minimum"), gettext("25% quantile"), gettext("Median"), gettext("75% quantile"), gettext("Maximum")),
+
+    value = c(nTotal, nValid, nMissing, sprintf("%.1f%%", nValid / nTotal * 100),
+              fmt(mean(valid)), fmt(sd(valid)),
+              fmt(.descriptivesSkewness(valid)), fmt(.descriptivesKurtosis(valid)),
+              fmt(min(valid)), fmt(ordQuantile(0.25)), fmt(ordQuantile(0.5)), fmt(ordQuantile(0.75)), fmt(max(valid))),
+    stringsAsFactors = FALSE
+  )
+
+  return(.descriptivesSummaryPanelDraw(rows))
+}
+
+# Draws a "label | value" panel with separator lines between the groups. Shared by the panels of all three blocks.
+# `rows` is a data.frame with the columns group (1, 2, ...), label and value (both character).
+# TODO: make .descriptivesSummaryNominalPanel() and .descriptivesSummaryOrdinalPanel() use this too,
+#       they still contain the same drawing code.
+.descriptivesSummaryPanelDraw <- function(rows) {
+  rows$y <- -(seq_len(nrow(rows)) + (rows$group - 1) * 0.6)
+
+  # a separator below every group except the last one
+  seps <- tapply(rows$y, rows$group, min)
+  seps <- seps[-length(seps)] - 0.6
+
+  ggplot2::ggplot() +
+    ggplot2::geom_text(data = rows, ggplot2::aes(x = 0, y = y, label = label), hjust = 0, size = 3.5, fontface = "bold") +
+    ggplot2::geom_text(data = rows, ggplot2::aes(x = 1, y = y, label = value), hjust = 1, size = 3.5) +
+    ggplot2::geom_hline(yintercept = seps, linewidth = .3) +
+    ggplot2::scale_x_continuous(limits = c(-0.1, 1.1)) +
+    ggplot2::scale_y_continuous(limits = c(min(rows$y) - 0.7, max(rows$y) + 0.7)) +
+    ggplot2::theme_void() +
+    ggplot2::theme(panel.border = ggplot2::element_rect(colour = "black", fill = NA, linewidth = .3))
+}
+
+# Labelled empty box, stands in for a plot that is not written yet. Delete when all placeholders are replaced.
+.descriptivesSummaryScalePlaceholder <- function(label) {
+  ggplot2::ggplot() +
+    ggplot2::annotate("text", x = 0, y = 0, label = label, size = 5) +
+    ggplot2::theme_void() +
+    ggplot2::theme(panel.border = ggplot2::element_rect(colour = "black", fill = NA, linewidth = .3))
+}
 
 .geometricMean <- function(x) {
   if (any(x <= 0)) return(NA)
