@@ -678,6 +678,124 @@ Form
 			CheckBox { name: "heatmapLegend"; label: qsTr("Display legend")	}
 
 		}
+
+		CheckBox
+		{
+			name: "vSummaryPlot"
+			label: qsTr("Variable summary plots")
+
+			Group
+			{
+				title: qsTr("Variable type")
+
+				CheckBox
+				{
+					name: "vNominal"
+					label: qsTr("Nominal")
+
+					VariablesForm
+					{
+						preferredHeight: 100 * preferencesModel.uiScale
+						preferredWidth: 540 * preferencesModel.uiScale
+
+						AvailableVariablesList
+						{
+							name: 				"summaryPlotNominalVariables"
+							source: 			[{ name: "allVariablesList", discard: ["variables", "splitBy"], use: "type=nominal"}]
+						}
+
+						AssignedVariablesList
+						{
+							name: 				"summaryPlotNominalVariablesSel"
+							id: 				summaryPlotNominalVariablesSel
+							singleVariable: 	false
+							title: 				qsTr("Selected Variables:")
+							allowedColumns: 	["nominal"]
+						}
+					}
+
+					RowLayout
+					{
+						spacing: 200
+
+						DropDown
+						{
+							name: "summaryNominalType"
+							label: qsTr("Plot type")
+							id: summaryNominalType
+							values: [
+									{label: qsTr("Bar plot"),	                value: "barPlot"    },
+									{label: qsTr("Stacked plot"),	            value: "stackedPlot"}
+								]
+						}
+
+						CheckBox
+						{
+							name: "summaryNominalDisp"
+							label: qsTr("Show descriptives")
+						}
+					}
+
+					
+
+
+				}
+
+				CheckBox
+				{
+					name: "vOrdinal"
+					label: qsTr("Ordinal")
+
+					VariablesForm
+					{
+						preferredHeight: 100 * preferencesModel.uiScale
+						preferredWidth: 540 * preferencesModel.uiScale
+
+						AvailableVariablesList
+						{
+							name: 				"summaryPlotOrdinalVariables"
+							source: 			[{ name: "allVariablesList", discard: ["variables", "splitBy"], use: "type=ordinal"}]
+						}
+
+						AssignedVariablesList
+						{
+							name: 				"summaryPlotOrdinalVariablesSel"
+							id: 				summaryPlotOrdinalVariablesSel
+							singleVariable: 	false
+							title: 				qsTr("Selected Variables:")
+							allowedColumns: 	["ordinal"]
+						}
+					}
+				}
+
+				CheckBox
+				{
+					name: "vScale"
+					label: qsTr("Scale")
+
+					VariablesForm
+					{
+						preferredHeight: 100 * preferencesModel.uiScale
+						preferredWidth: 540 * preferencesModel.uiScale
+
+						AvailableVariablesList
+						{
+							name: 				"summaryPlotScaleVariables"
+							source: 			[{ name: "allVariablesList", discard: ["variables", "splitBy"], use: "type=scale"}]
+						}
+
+						AssignedVariablesList
+						{
+							name: 				"summaryPlotScaleVariablesSel"
+							id: 				summaryPlotScaleVariablesSel
+							singleVariable: 	false
+							title: 				qsTr("Selected Variables:")
+							allowedColumns: 	["scale"]
+						}
+					}
+				}
+			}
+		}
 	}
 
 	Section

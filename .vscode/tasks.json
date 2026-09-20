@@ -1,0 +1,30 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "JASP: Install Module",
+      "type": "process",
+      "command": "Rscript",
+      "args": ["-e", "renv::activate(); renv::install('.')"],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      }
+    },
+    {
+      "label": "JASP: Check Lib Paths",
+      "type": "process",
+      "command": "Rscript",
+      "args": ["-e", "renv::activate(); print(.libPaths())"],
+      "group": "build",
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      }
+    }
+  ]
+}

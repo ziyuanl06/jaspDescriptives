@@ -337,6 +337,20 @@ DescriptivesInternal <- function(jaspResults, dataset, options) {
     .descriptivesDensityPlots(jaspResults[["densityPlot"]], dataset, variables, options)
   }
 
+  # Variable summary plots (nominal)
+  if (options[["vSummaryPlot"]] && options[["vNominal"]]) {
+    if (is.null(jaspResults[["summaryPlotNominal"]])) {
+      jaspResults[["summaryPlotNominal"]] <- createJaspContainer(gettext("Variable Summary Plots (Nominal)"))
+      jaspResults[["summaryPlotNominal"]]$dependOn(c(
+        "vSummaryPlot", "vNominal",
+        "summaryNominalType", "summaryNominalDisp", "colorPalette"
+      ))
+      jaspResults[["summaryPlotNominal"]]$position <- 18 # 1-17 are taken
+    }
+
+    .descriptivesSummaryNominal(jaspResults[["summaryPlotNominal"]], dataset, options)
+  }
+
   # Likert plots
   if (options[["likertPlot"]]) {
     if (is.null(jaspResults[["likertPlot"]])) {
@@ -2719,6 +2733,188 @@ DescriptivesInternal <- function(jaspResults, dataset, options) {
 
 
   container[[plotName]] <- densPlot
+}
+
+## Variable summary plots: nominal -------------------------------------------------------------------------------------
+
+.descriptivesSummaryNominal <- function(container, dataset, options) {
+  variables <- unlist(options[["summaryPlotNominalVariablesSel"]])
+
+  # not ready to plot
+  if (length(variables) == 0)
+    return()
+
+  # NOTE: like densityPlotSeparate, columns from any AssignedVariablesList are passed to R in `dataset`.
+  # TODO: check what the nominal columns look like when they arrive here (e.g. print(class(dataset[[variables[1]]]))
+  #       and check the JASP log): factor or something else? This affects table() and the sorting later.
+
+  for (i in seq_along(variables)) {
+    variableName <- variables[[i]]
+
+    # NOTE: `variable` keeps its NAs (the Missing column of the main table is computed from `dataset`, see
+    #       `rows - length(na.omitted)`). Only rows with NA in the split-by variable are dropped, see the top of
+    #       DescriptivesInternal. Do not na.omit() here, the Missing count is needed.
+    variable <- dataset[[variableName]]
+    freqTable <- .descriptivesSummaryNominalFreqTable(variable)
+
+    if (options[["summaryNominalType"]] == "barPlot"){
+      plot <- createJaspPlot(title = gettextf("Summary for %s", variableName), width = 720, height = 320, position = i)
+      plot$dependOn(optionContainsValue = list(summaryPlotNominalVariablesSel = variableName))
+      container[[variableName]] <- plot
+
+      errorMessage <- .descriptivesCheckPlotErrors(dataset, variableName, obsAmount = "< 1")
+
+      if (!is.null(errorMessage)){
+        plot$setError(errorMessage)
+        next
+      }
+      main <- .descriptivesSummaryNominalBarPlot(freqTable, options)
+    }
+      
+    
+    if (options[["summaryNominalType"]] == "stackedPlot") {
+      plot <- createJaspPlot(title = variableName, width = 720, height = 320, position = i)
+      plot$dependOn(optionContainsValue = list(summaryPlotNominalVariablesSel = variableName))
+      container[[variableName]] <- plot
+
+      errorMessage <- .descriptivesCheckPlotErrors(dataset, variableName, obsAmount = "< 1")
+
+      if (!is.null(errorMessage)){
+        plot$setError(errorMessage)
+        next
+      }
+      main <- .descriptivesSummaryNominalStackedPlot(freqTable, options)
+    }
+
+    if (options[["summaryNominalDisp"]]) {
+      panel <- .descriptivesSummaryNominalPanel(variable, freqTable)
+      main  <- patchwork::wrap_plots(main, panel, widths = c(3, 1))
+    }
+    plot$plotObject <- main
+
+  }
+}
+
+
+.descriptivesSummaryNominalFreqTable <- function(variable) {
+  freqNominal <- table(variable)
+  freqNominal <- sort(freqNominal, decreasing = TRUE)
+  freqNominal <- freqNominal[as.vector(freqNominal) != 0]
+
+  naCount <- sum(is.na(variable))
+  if (naCount > 0)
+    freqNominal[["Missing"]] <- naCount
+  
+  propNominal <- as.vector(freqNominal) / sum(as.vector(freqNominal))
+  freqNominalFrame <- data.frame(level = names(freqNominal), 
+                                 count = as.vector(unname(freqNominal)),
+                                 prop = as.vector(propNominal))
+
+  factor(freqNominalFrame$level, levels = freqNominalFrame$level)
+  
+  return(freqNominalFrame)
+}
+
+# Bar plot: one bar per level, frequency written above each bar
+# TODO: ggplot2 + jaspGraphs::themeJasp; Missing bar in gray; same level -> same color as in the stacked plot
+.descriptivesSummaryNominalBarPlot <- function(freqTable, options) {
+  freqTable$level <- factor(freqTable$level, levels = freqTable$level)
+  p <- ggplot2::ggplot(freqTable, ggplot2::aes(x = level, y = count, fill = level)) +
+       ggplot2::geom_bar(stat = "identity", col = "black", width = 0.7, linewidth = .3) +
+       ggplot2::geom_text(ggplot2::aes(label = count), vjust = -0.5)
+  
+  values <- .descriptivesSummaryNominalColors(freqTable, options)
+
+  p <- p + 
+       ggplot2::scale_fill_manual(values = values) + 
+       ggplot2::theme(legend.position = "none") +
+       jaspGraphs::geom_rangeframe() + 
+       jaspGraphs::themeJaspRaw() +
+       ggplot2::ylab(gettext("Frequency")) +
+       ggplot2::xlab(gettext("Level"))
+  
+  yBreaks <- jaspGraphs::getPrettyAxisBreaks(c(0, freqTable$count))
+  p <- p + 
+       ggplot2::scale_y_continuous(breaks = yBreaks, limits = range(yBreaks))
+
+  return(p)
+}
+
+# Stacked plot: one horizontal 100% bar, each segment labelled "count (percentage)"
+.descriptivesSummaryNominalStackedPlot <- function(freqTable, options) {
+  freqTable$level <- factor(freqTable$level, levels = freqTable$level)
+  values <- .descriptivesSummaryNominalColors(freqTable, options)
+
+  freqTable$label <- ifelse(freqTable$prop < 0.05, "",
+                          sprintf("%d\n%.1f%%", freqTable$count, freqTable$prop * 100))
+  
+  p <- ggplot2::ggplot(freqTable, ggplot2::aes(x = prop, y = "", fill = level)) +
+       ggplot2::geom_col(position = ggplot2::position_stack(reverse = TRUE),
+                    col = "black", width = 0.5, linewidth = .3) +
+       ggplot2::geom_text(ggplot2::aes(label = label),
+                   position = ggplot2::position_stack(vjust = 0.5, reverse = TRUE)) +
+       ggplot2::scale_fill_manual(values = values, name = NULL) +
+       ggplot2::scale_x_continuous(breaks = seq(0, 1, .25), limits = c(0, 1),
+                            labels = function(x) paste0(x * 100, "%")) +
+       ggplot2::xlab(gettext("Percentage")) + ggplot2::ylab(NULL) +
+       jaspGraphs::geom_rangeframe(sides = "b") +
+       ggplot2::scale_y_discrete(expand = ggplot2::expansion(add = 0.3)) +
+       jaspGraphs::themeJaspRaw(legend.position = "bottom") +
+       ggplot2::theme(axis.ticks.y = ggplot2::element_blank())
+  
+  return(p)
+}
+
+
+.descriptivesSummaryNominalColors <- function(freqTable, options){
+  realLevels <- setdiff(levels(freqTable$level), "Missing")
+  cols   <- rep_len(jaspGraphs::JASPcolors(options[["colorPalette"]]), length(realLevels))
+  values <- stats::setNames(cols, realLevels)
+
+  if ("Missing" %in% levels(freqTable$level))
+    values <- c(values, Missing = "grey")
+  
+  return(values)
+}
+
+# Stats panel shown to the right of the main plot (mimics Minitab's summary report, see EJ's screenshot)
+# TODO: an empty ggplot with annotate("text") for "label | value" and lines to separate the groups:
+#   group 1: total N, valid N, missing N
+#   group 2: valid proportion
+#   group 3: number of levels, mode (most frequent level) and its count
+.descriptivesSummaryNominalPanel <- function(variable, freqTable) {
+  nTotal <- length(variable)
+  nMissing <- sum(is.na(variable))
+  nValid <- nTotal - nMissing
+  validTab <- freqTable[freqTable$level != "Missing",]
+
+  rows <- data.frame(
+    group = c(1, 1, 1, 2, 3, 3, 3),
+    label = c(gettext("Total N"), gettext("Valid N"), gettext("Missing N"),
+              gettext("Valid %"),
+              gettext("Levels"), gettext("Mode"), gettext("Mode count")),
+    value = c(nTotal, nValid, nMissing,
+              sprintf("%.1f%%", nValid / nTotal * 100),
+              nrow(validTab), as.character(validTab$level[1]), validTab$count[1]),
+    stringsAsFactors = FALSE
+  )
+
+  rows$y <- -(seq_len(nrow(rows)) + (rows$group - 1) * 0.6)
+
+  pPanel <- ggplot2::ggplot() +
+    ggplot2::geom_text(data = rows, ggplot2::aes(x = 0, y = y, label = label), hjust = 0, size = 3.5, fontface = "bold") +
+    ggplot2::geom_text(data = rows, ggplot2::aes(x = 1, y = y, label = value), hjust = 1, size = 3.5)
+
+  seps <- tapply(rows$y, rows$group, min)[-3] - 0.6
+
+  pPanel <- pPanel + 
+            ggplot2::geom_hline(yintercept = seps, linewidth = .3) +
+            ggplot2::scale_x_continuous(limits = c(-0.1, 1.1)) +
+            ggplot2::scale_y_continuous(limits = c(min(rows$y) - 0.7, max(rows$y) + 0.7)) +
+            ggplot2::theme_void() +
+            ggplot2::theme(panel.border = ggplot2::element_rect(colour = "black", fill = NA, linewidth = .3))
+  
+  return(pPanel)
 }
 
 .geometricMean <- function(x) {
