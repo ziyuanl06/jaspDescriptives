@@ -701,7 +701,7 @@ Form
 						AvailableVariablesList
 						{
 							name: 				"summaryPlotNominalVariables"
-							source: 			[{ name: "allVariablesList", discard: ["variables", "splitBy"], use: "type=nominal"}]
+							source: 			[{ isDataSetVariables: true, discard: ["splitBy"], use: "type=nominal"}]
 						}
 
 						AssignedVariablesList
@@ -750,7 +750,7 @@ Form
 						AvailableVariablesList
 						{
 							name: 				"summaryPlotOrdinalVariables"
-							source: 			[{ name: "allVariablesList", discard: ["variables", "splitBy"], use: "type=ordinal"}]
+							source: 			[{ isDataSetVariables: true, discard: ["splitBy"], use: "type=ordinal"}]
 						}
 
 						AssignedVariablesList
@@ -782,7 +782,7 @@ Form
 						AvailableVariablesList
 						{
 							name: 				"summaryPlotScaleVariables"
-							source: 			[{ name: "allVariablesList", discard: ["variables", "splitBy"], use: "type=scale"}]
+							source: 			[{ isDataSetVariables: true, discard: ["splitBy"], use: "type=scale"}]
 						}
 
 						AssignedVariablesList
