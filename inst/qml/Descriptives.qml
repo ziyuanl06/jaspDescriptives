@@ -847,6 +847,13 @@ Form
 							{
 								name: "summaryScaleTimeSeries"
 								label: qsTr("Time series")
+
+								CheckBox
+								{
+									name: "summaryScaleTimeSeriesDots"
+									label: qsTr("Show dots")
+									checked: true
+								}
 							}
 						}
 					}

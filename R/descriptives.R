@@ -373,7 +373,8 @@ DescriptivesInternal <- function(jaspResults, dataset, options) {
       #       own variable through optionContainsValue. quantilesType is needed for the median/quartiles.
       jaspResults[["summaryPlotScale"]]$dependOn(c(
         "vSummaryPlot", "vScale", "summaryScaleMainType", "summaryScaleRaindrops", "summaryScaleDensline",
-        "summaryScaleQQ", "summaryScaleTimeSeries", "summaryScaleNumbers", "colorPalette", "quantilesType"
+        "summaryScaleQQ", "summaryScaleTimeSeries", "summaryScaleTimeSeriesDots", "summaryScaleNumbers",
+        "colorPalette", "quantilesType"
       ))
       jaspResults[["summaryPlotScale"]]$position <- 20
     }
@@ -2786,7 +2787,12 @@ DescriptivesInternal <- function(jaspResults, dataset, options) {
     freqTable <- .descriptivesSummaryNominalFreqTable(variable)
 
     if (options[["summaryNominalType"]] == "barPlot"){
-      plot <- createJaspPlot(title = gettextf("Summary for %s", variableName), width = 720, height = 320, position = i)
+      # many levels: the plot only shows the most frequent ones, the rest as one "Other" bar (the panel keeps
+      # describing all of them)
+      plotTable <- .descriptivesSummaryNominalMergeLevels(freqTable, .descriptivesSummaryNominalMaxLevels - 1)
+      # taller when the level names are slanted, they take more height that way
+      height    <- if (.descriptivesSummaryNominalBarSlanted(plotTable, options)) 400 else 320
+      plot <- createJaspPlot(title = gettextf("Summary for %s", variableName), width = 720, height = height, position = i)
       plot$dependOn(optionContainsValue = list(summaryPlotNominalVariablesSel = variableName))
       container[[variableName]] <- plot
 
@@ -2796,12 +2802,17 @@ DescriptivesInternal <- function(jaspResults, dataset, options) {
         plot$setError(errorMessage)
         next
       }
-      main <- .descriptivesSummaryNominalBarPlot(freqTable, options)
+      main <- .descriptivesSummaryNominalBarPlot(plotTable, options)
     }
       
     
     if (options[["summaryNominalType"]] == "stackedPlot") {
-      plot <- createJaspPlot(title = variableName, width = 720, height = 320, position = i)
+      # many levels: as for the bar plot, but here as many levels as can be labelled (there is no legend)
+      plotTable <- .descriptivesSummaryNominalStackedMergeLevels(freqTable, options)
+      # taller when some labels go above the bar (segments too narrow for them, see
+      # .descriptivesSummaryNominalStackedLabels())
+      needsRoom <- !all(.descriptivesSummaryNominalStackedLabels(plotTable, options)$inside)
+      plot <- createJaspPlot(title = variableName, width = 720, height = if (needsRoom) 400 else 320, position = i)
       plot$dependOn(optionContainsValue = list(summaryPlotNominalVariablesSel = variableName))
       container[[variableName]] <- plot
 
@@ -2811,12 +2822,22 @@ DescriptivesInternal <- function(jaspResults, dataset, options) {
         plot$setError(errorMessage)
         next
       }
-      main <- .descriptivesSummaryNominalStackedPlot(freqTable, options)
+      main <- .descriptivesSummaryNominalStackedPlot(plotTable, options)
     }
+
+    nMerged <- nrow(freqTable) - nrow(plotTable) + 1
+    if (nMerged > 1)
+      main <- main +
+        ggplot2::labs(caption = gettextf("Other: the %d levels with the lowest frequencies.", nMerged)) +
+        ggplot2::theme(plot.caption = ggplot2::element_text(size = 12, hjust = 0))
 
     if (options[["summaryNominalDisp"]]) {
       panel <- .descriptivesSummaryNominalPanel(variable, freqTable)
-      main  <- patchwork::wrap_plots(main, panel, widths = c(3, 1))
+      # margins, not just the two plots pushed together: side by side with nothing between them, it was not
+      # obvious at a glance which axis (the plot's or the panel's own numbers) a given tick label belonged to
+      main  <- patchwork::wrap_plots(main + ggplot2::theme(plot.margin = ggplot2::margin(r = 12)),
+                                     panel + ggplot2::theme(plot.margin = ggplot2::margin(l = 12)),
+                                     widths = c(3, 1))
     }
     plot$plotObject <- main
 
@@ -2843,12 +2864,46 @@ DescriptivesInternal <- function(jaspResults, dataset, options) {
   return(freqNominalFrame)
 }
 
-# Bar plot: one bar per level, frequency written above each bar
+# The most levels a plot shows ("Other" included, Missing not). With more than that, the least frequent ones are
+# shown together as "Other": at least two of them, never a single level under another name
+.descriptivesSummaryNominalMaxLevels <- 8
+
+# `freqTable` with only its `keep` most frequent levels, the others summed into one "Other" row (after them,
+# before Missing). Unchanged if that would leave fewer than two levels for "Other".
+.descriptivesSummaryNominalMergeLevels <- function(freqTable, keep) {
+  isMissing <- freqTable$level == "Missing"
+  real      <- freqTable[!isMissing, ]
+  if (nrow(real) <= keep + 1)
+    return(freqTable)
+
+  rest  <- real[-seq_len(keep), ]
+  other <- data.frame(level = "Other", count = sum(rest$count), prop = sum(rest$prop))
+
+  return(rbind(real[seq_len(keep), ], other, freqTable[isMissing, ]))
+}
+
+# For the stacked plot: there the labels name the segments (no legend), so on top of the fixed maximum, levels
+# are merged until every segment that is left gets its label, inside it or above the bar
+.descriptivesSummaryNominalStackedMergeLevels <- function(freqTable, options) {
+  barPx <- .descriptivesSummaryNominalStackedBarPx(options)
+  for (keep in (.descriptivesSummaryNominalMaxLevels - 1):1) {
+    merged  <- .descriptivesSummaryNominalMergeLevels(freqTable, keep)
+    labels  <- .descriptivesSummaryNominalStackedLabels(merged, options)
+    outside <- .descriptivesSummaryNominalOutsideLabels(labels[!labels$inside, ], barPx)
+    if (nrow(outside) == sum(!labels$inside))
+      break
+  }
+
+  return(merged)
+}
+
+# Bar plot: one bar per level, frequency written above each bar (in a white box with a thin border)
 .descriptivesSummaryNominalBarPlot <- function(freqTable, options) {
   freqTable$level <- factor(freqTable$level, levels = freqTable$level)
   p <- ggplot2::ggplot(freqTable, ggplot2::aes(x = level, y = count, fill = level)) +
        ggplot2::geom_bar(stat = "identity", col = "black", width = 0.7, linewidth = .3) +
-       ggplot2::geom_text(ggplot2::aes(label = count), vjust = -0.5)
+       ggplot2::geom_label(ggplot2::aes(label = count), vjust = -0.3, size = .descriptivesSummaryNominalTextSize,
+                           fill = "white", colour = "black", linewidth = .3, show.legend = FALSE)
   
   values <- .descriptivesSummaryNominalColors(freqTable, options)
 
@@ -2860,44 +2915,160 @@ DescriptivesInternal <- function(jaspResults, dataset, options) {
        ggplot2::ylab(gettext("Frequency")) +
        ggplot2::xlab(gettext("Level"))
   
-  yBreaks <- jaspGraphs::getPrettyAxisBreaks(c(0, freqTable$count))
+  if (.descriptivesSummaryNominalBarSlanted(freqTable, options))
+    p <- p + ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 30, hjust = 1, vjust = 1))
+
+  # 35% headroom over the tallest bar for its boxed count label: with the axis ending right at that count (e.g. a
+  # count of exactly 100), the label above the bar would be cut off at the top of the panel
+  yBreaks <- jaspGraphs::getPrettyAxisBreaks(c(0, max(freqTable$count) * 1.35))
   p <- p + 
        ggplot2::scale_y_continuous(breaks = yBreaks, limits = range(yBreaks))
 
   return(p)
 }
 
-# Stacked plot: one horizontal 100% bar, each segment labelled "count (percentage)"
+# Whether the bar plot's level names are slanted: when the longest would not fit in the width one bar gets, at
+# ~11 px per character of axis text. The bars share ~100 px less than the plot (axis, margins), or than the 3/4
+# of it left with the panel shown.
+.descriptivesSummaryNominalBarSlanted <- function(freqTable, options) {
+  slotPx <- ((if (options[["summaryNominalDisp"]]) 720 * 3 / 4 else 720) - 100) / nrow(freqTable)
+  return(max(nchar(as.character(freqTable$level))) * 11 > slotPx)
+}
+
+# Stacked plot: one horizontal 100% bar, each segment labelled with its level, count and percentage (in a white
+# box), so without a legend. See .descriptivesSummaryNominalStackedMergeLevels() for when there are many levels
 .descriptivesSummaryNominalStackedPlot <- function(freqTable, options) {
   freqTable$level <- factor(freqTable$level, levels = freqTable$level)
   values <- .descriptivesSummaryNominalColors(freqTable, options)
 
-  freqTable$label <- ifelse(freqTable$prop < 0.05, "",
-                          sprintf("%d\n%.1f%%", freqTable$count, freqTable$prop * 100))
-  
-  p <- ggplot2::ggplot(freqTable, ggplot2::aes(x = prop, y = "", fill = level)) +
-       ggplot2::geom_col(position = ggplot2::position_stack(reverse = TRUE),
+  textSize  <- .descriptivesSummaryNominalTextSize
+  barPx     <- .descriptivesSummaryNominalStackedBarPx(options)
+  freqTable <- .descriptivesSummaryNominalStackedLabels(freqTable, options)
+
+  inside  <- freqTable[freqTable$inside, ]
+  outside <- .descriptivesSummaryNominalOutsideLabels(freqTable[!freqTable$inside, ], barPx)
+
+  p <- ggplot2::ggplot(freqTable, ggplot2::aes(x = prop, y = 1, fill = level)) +
+       # orientation = "y": with y numeric (1, so the outside labels can be placed above it) rather than discrete,
+       # ggplot2 would otherwise take both axes as continuous and draw vertical bars
+       ggplot2::geom_col(position = ggplot2::position_stack(reverse = TRUE), orientation = "y",
                     col = "black", width = 0.5, linewidth = .3) +
-       ggplot2::geom_text(ggplot2::aes(label = label),
-                   position = ggplot2::position_stack(vjust = 0.5, reverse = TRUE)) +
+       # black on a white box with a thin border: readable on every palette, dark or light
+       .descriptivesSummaryNominalStackedBoxes(inside, ggplot2::aes(x = centre, y = 1), textSize)
+
+  # the segments too narrow for their label: the label above the bar, joined to its segment by a thin line
+  if (nrow(outside) > 0)
+    p <- p +
+      ggplot2::geom_segment(data = outside, ggplot2::aes(x = centre, xend = labelX, y = 1.26, yend = 1.4),
+                            colour = "grey50", linewidth = .3, inherit.aes = FALSE) +
+      .descriptivesSummaryNominalStackedBoxes(outside, ggplot2::aes(x = labelX, y = 1.4), textSize, vjust = 0)
+
+  p <- p +
        ggplot2::scale_fill_manual(values = values, name = NULL) +
-       ggplot2::scale_x_continuous(breaks = seq(0, 1, .25), limits = c(0, 1),
-                            labels = function(x) paste0(x * 100, "%")) +
+       # no limits here but in coord_cartesian(): the proportions can add up to a hair over 1 (floating point), and
+       # the last segment would be dropped as out of range
+       ggplot2::scale_x_continuous(breaks = seq(0, 1, .25), labels = function(x) paste0(x * 100, "%")) +
        ggplot2::xlab(gettext("Percentage")) + ggplot2::ylab(NULL) +
        jaspGraphs::geom_rangeframe(sides = "b") +
-       ggplot2::scale_y_discrete(expand = ggplot2::expansion(add = 0.3)) +
-       jaspGraphs::themeJaspRaw(legend.position = "bottom") +
-       ggplot2::theme(axis.ticks.y = ggplot2::element_blank())
+       # room above the bar for the outside labels, three lines of text
+       ggplot2::scale_y_continuous(limits = c(0.7, if (nrow(outside) > 0) 2 else 1.3), expand = c(0, 0)) +
+       ggplot2::coord_cartesian(xlim = c(0, 1), clip = "off") +
+       jaspGraphs::themeJaspRaw(legend.position = "none") +
+       ggplot2::theme(axis.ticks.y = ggplot2::element_blank(), axis.text.y = ggplot2::element_blank())
   
   return(p)
 }
 
+# The stacked plot's boxed labels: level name in bold, count and percentage in plain below it. A single label
+# cannot mix font faces, so the box is drawn from the whole label with its text hidden (in bold, the wider of the
+# two faces), and the two parts go on top as text: both are three lines high (blank lines for the other part's),
+# so they line up with the box and with each other
+.descriptivesSummaryNominalStackedBoxes <- function(data, mapping, textSize, vjust = 0.5) {
+  list(
+    ggplot2::geom_label(data = data, mapping = utils::modifyList(mapping, ggplot2::aes(label = label)),
+                        size = textSize, fontface = "bold", fill = "white", text.colour = NA,
+                        border.colour = "black", linewidth = .3, vjust = vjust, lineheight = .9, inherit.aes = FALSE),
+    ggplot2::geom_label(data = data, mapping = utils::modifyList(mapping, ggplot2::aes(label = labelName)),
+                        size = textSize, fontface = "bold", fill = NA, colour = "black", border.colour = NA,
+                        vjust = vjust, lineheight = .9, inherit.aes = FALSE),
+    ggplot2::geom_label(data = data, mapping = utils::modifyList(mapping, ggplot2::aes(label = labelNumbers)),
+                        size = textSize, fill = NA, colour = "black", border.colour = NA,
+                        vjust = vjust, lineheight = .9, inherit.aes = FALSE)
+  )
+}
+
+# Text size of the boxed numbers in both plots, and the stacked bar's width in px: the bar is ~60 px short of the
+# 720 px plot (axis padding, margins), and gets 3/4 of it, less the margins between the two, when the panel is
+# shown next to it (measured: 654 and 458 px)
+.descriptivesSummaryNominalTextSize <- 6.5
+.descriptivesSummaryNominalStackedBarPx <- function(options) {
+  if (options[["summaryNominalDisp"]]) 720 * 3 / 4 - 85 else 720 - 60
+}
+
+# The stacked plot's labels ("level\ncount\npercent"), each segment's centre (0-1) and whether its label fits inside
+# it: the widest of its three lines against the segment's share of the bar, at ~0.6 * size mm per character (a little
+# wider than for the digits-only labels of the scale block, see .descriptivesSummaryScaleLabelMM(): "%" is wider
+# than a digit, "10.7%" measured ~47 px at size 4.5). Also used before the plot is made, to size it.
+.descriptivesSummaryNominalStackedLabels <- function(freqTable, options) {
+  textSize <- .descriptivesSummaryNominalTextSize
+  freqTable$label        <- sprintf("%s\n%d\n%.1f%%", freqTable$level, freqTable$count, freqTable$prop * 100)
+  freqTable$labelName    <- sprintf("%s\n \n ", freqTable$level)
+  freqTable$labelNumbers <- sprintf(" \n%d\n%.1f%%", freqTable$count, freqTable$prop * 100)
+  # the level name is in bold, a little wider per character
+  freqTable$widthPx <- pmax(nchar(as.character(freqTable$level)) * 1.1, nchar(freqTable$count),
+                            nchar(sprintf("%.1f%%", freqTable$prop * 100))) *
+    textSize * 0.6 * 96 / 25.4 + 16
+  freqTable$centre  <- cumsum(freqTable$prop) - freqTable$prop / 2
+  freqTable$inside  <- freqTable$prop * .descriptivesSummaryNominalStackedBarPx(options) >= freqTable$widthPx
+
+  return(freqTable)
+}
+
+# Where to put the labels that do not fit inside their segment (`labels`: rows of the stacked plot's table, with
+# centre and widthPx), in one row above the bar: each as close to its own segment as it can be without touching
+# its neighbours. With c the cumulative minimum distance from the first label, x_i = z_i + c_i for any
+# non-decreasing z keeps them apart, and the z closest to (centre - c) is the isotonic regression of it (the
+# least total displacement), then kept inside the bar at both ends. If they cannot all fit side by side
+# at all (many tiny levels), the smallest ones are dropped until they do. Adds labelX (0-1, like centre).
+.descriptivesSummaryNominalOutsideLabels <- function(labels, barPx) {
+  if (nrow(labels) == 0)
+    return(cbind(labels, labelX = numeric(0)))
+
+  keep <- order(labels$prop, decreasing = TRUE)
+  keep <- keep[cumsum(labels$widthPx[keep]) <= barPx]
+  labels <- labels[sort(keep), ]
+  if (nrow(labels) == 0)
+    return(cbind(labels, labelX = numeric(0)))
+
+  w      <- labels$widthPx / barPx
+  c      <- c(0, cumsum((w[-1] + w[-length(w)]) / 2))
+  z      <- if (nrow(labels) == 1) labels$centre else stats::isoreg(seq_along(c), labels$centre - c)$yf
+  # inside the bar at both ends: clamping z keeps it non-decreasing (shifting the row as a whole, as before, could
+  # push the first label out on the left to get the last one in on the right)
+  z      <- pmin(pmax(z, w[1] / 2), max(w[1] / 2, 1 - c[length(c)] - w[length(w)] / 2))
+  labels$labelX <- z + c
+
+  return(labels)
+}
+
+
 
 .descriptivesSummaryNominalColors <- function(freqTable, options){
-  realLevels <- setdiff(levels(freqTable$level), "Missing")
-  cols   <- rep_len(jaspGraphs::JASPcolors(options[["colorPalette"]]), length(realLevels))
+  realLevels <- setdiff(levels(freqTable$level), c("Other", "Missing"))
+  palette <- jaspGraphs::JASPcolors(options[["colorPalette"]])
+  # viridis and inferno are a continuous 256-colour ramp: the first few of those are all the same dark purple, so
+  # spread evenly over the ramp instead. Not for the discrete palettes (8 or fewer colours): there the function
+  # blends neighbouring colours into new ones instead of using the palette's own
+  cols <- if (length(palette) > 20) {
+    jaspGraphs::JASPcolors(options[["colorPalette"]], asFunction = TRUE)(length(realLevels))
+  } else {
+    rep_len(palette, length(realLevels))
+  }
   values <- stats::setNames(cols, realLevels)
 
+  # two greys, both outside the palette: light for the merged levels, darker for Missing
+  if ("Other" %in% levels(freqTable$level))
+    values <- c(values, Other = "grey90")
   if ("Missing" %in% levels(freqTable$level))
     values <- c(values, Missing = "grey")
   
@@ -2971,7 +3142,10 @@ DescriptivesInternal <- function(jaspResults, dataset, options) {
 
     if (options[["summaryOrdinalDisp"]]) {
       panel <- .descriptivesSummaryOrdinalPanel(variable, freqTable, options)
-      main  <- patchwork::wrap_plots(main, panel, widths = c(3, 1))
+      # margins, not just the two plots pushed together: see the same fix in .descriptivesSummaryNominal()
+      main  <- patchwork::wrap_plots(main + ggplot2::theme(plot.margin = ggplot2::margin(r = 12)),
+                                     panel + ggplot2::theme(plot.margin = ggplot2::margin(l = 12)),
+                                     widths = c(3, 1))
     }
     plot$plotObject <- main
 
@@ -3001,7 +3175,7 @@ DescriptivesInternal <- function(jaspResults, dataset, options) {
   freqTable$level <- factor(freqTable$level, levels = freqTable$level)
   p <- ggplot2::ggplot(freqTable, ggplot2::aes(x = level, y = count, fill = level)) +
        ggplot2::geom_bar(stat = "identity", col = "black", width = 0.7, linewidth = .3) +
-       ggplot2::geom_text(ggplot2::aes(label = count), vjust = -0.5)
+       ggplot2::geom_text(ggplot2::aes(label = count), vjust = -0.5, size = 5.5)
 
   values <- .descriptivesSummaryOrdinalColors(freqTable, options)
 
@@ -3013,7 +3187,9 @@ DescriptivesInternal <- function(jaspResults, dataset, options) {
        ggplot2::ylab(gettext("Frequency")) +
        ggplot2::xlab(gettext("Level"))
   
-  yBreaks <- jaspGraphs::getPrettyAxisBreaks(c(0, freqTable$count))
+  # 15% headroom over the tallest bar for its count label: with the axis ending right at that count (e.g. a
+  # count of exactly 100), the label above the bar would be cut off at the top of the panel
+  yBreaks <- jaspGraphs::getPrettyAxisBreaks(c(0, max(freqTable$count) * 1.15))
   p <- p + 
        ggplot2::scale_y_continuous(breaks = yBreaks, limits = range(yBreaks))
 
@@ -3100,7 +3276,8 @@ DescriptivesInternal <- function(jaspResults, dataset, options) {
   showPanels <- c(timeSeries = options[["summaryScaleTimeSeries"]],
                   qq         = options[["summaryScaleQQ"]],
                   numbers    = options[["summaryScaleNumbers"]])
-  size <- .descriptivesSummaryScaleSize(showPanels)
+  size     <- .descriptivesSummaryScaleSize(showPanels)
+  mainWidth <- .descriptivesSummaryScaleMainWidth(size[["width"]], names(showPanels)[showPanels])
 
   for (i in seq_along(variables)) {
     variableName <- variables[[i]]
@@ -3123,19 +3300,36 @@ DescriptivesInternal <- function(jaspResults, dataset, options) {
 
     # main plot
     main <- if (options[["summaryScaleMainType"]] == "rain") {
-      .descriptivesSummaryScaleRaincloud(variable, options)
+      .descriptivesSummaryScaleRaincloud(variable, options, mainWidth)
     } else {
-      .descriptivesSummaryScaleHistogram(variable, options)
+      .descriptivesSummaryScaleHistogram(variable, options, mainWidth)
     }
 
     # supplementary panels
     panels <- list()
-    if (showPanels[["timeSeries"]]) panels[["timeSeries"]] <- .descriptivesSummaryScaleTimeSeries(variable, options)
+    if (showPanels[["timeSeries"]])
+      panels[["timeSeries"]] <- .descriptivesSummaryScaleTimeSeries(variable, options, variableName,
+                                                                     rowNumbers = as.integer(row.names(dataset)))
     if (showPanels[["qq"]])         panels[["qq"]]         <- .descriptivesSummaryScaleQQ(variable, options)
     if (showPanels[["numbers"]])    panels[["numbers"]]    <- .descriptivesSummaryScalePanel(variable, options)
 
-    plot$plotObject <- .descriptivesSummaryScaleLayout(main, panels)
+    mainTitle <- if (options[["summaryScaleMainType"]] == "rain") gettext("Raincloud plot") else gettext("Histogram")
+    plot$plotObject <- .descriptivesSummaryScaleLayout(main, panels, mainTitle)
   }
+}
+
+# The main plot does not always get the full JASP plot width: once patchwork lays supplementary panels beside
+# it (see .descriptivesSummaryScaleLayout), it only gets a share. Used to keep the raincloud's labels sized to
+# the space they will actually be drawn in, see .descriptivesSummaryScaleDeclutter().
+.descriptivesSummaryScaleMainWidth <- function(width, panelNames) {
+  # the numbers panel is a column on the right, the rest is laid out in the remaining (left) part
+  if ("numbers" %in% panelNames)
+    return(width * 3 / 4.75)
+
+  # one plot next to main: half the width; two plots: main spans the whole width above them
+  if (length(panelNames) == 1) return(width / 2)
+
+  return(width)
 }
 
 # Size of the JASP plot, depends on how many supplementary panels are shown
@@ -3144,37 +3338,81 @@ DescriptivesInternal <- function(jaspResults, dataset, options) {
   nPanels <- sum(showPanels)
   size <- switch(as.character(nPanels),
                  "0" = c(width = 720, height = 240),
-                 "1" = c(width = 900, height = 320),
-                 "2" = c(width = 900, height = 600),
-                 c(width = 900, height = 640))
+                 # the numbers panel alone still needs the height for its ~20 rows of text
+                 "1" = c(width = 900, height = if (showPanels[["numbers"]]) 520 else 360),
+                 "2" = c(width = 900, height = 700),
+                 # wider: the time series and the Q-Q plot share the part left of the numbers column
+                 c(width = 1000, height = 720))
 
-  # one factor to make every layout smaller or larger without changing the proportions
-  sizeFactor <- 0.8
+  # the numbers column needs ~330 px for its "estimate [95% CI]" rows at its text size, 1120 px in all keeps it
+  # there without squeezing the plots next to it
+  if (showPanels[["numbers"]])
+    size[["width"]] <- 1120
+
+  # one factor to make every layout smaller or larger without changing the proportions; the font sizes are fixed
+  # in pt, so a smaller image also leaves less whitespace between the panels
+  sizeFactor <- 0.9
 
   return(round(size * sizeFactor))
 }
 
 # Put the main plot and the panels together with patchwork
 # TODO: tune widths/heights; check the numbers panel (narrow) next to a wide plot
-.descriptivesSummaryScaleLayout <- function(main, panels) {
+.descriptivesSummaryScaleLayout <- function(main, panels, mainTitle) {
   nPanels <- length(panels)
 
   if (nPanels == 0)
     return(main)
 
-  if (nPanels == 1) {
-    # the numbers panel is only a few lines of text, so it gets a narrow column
-    widths <- if (names(panels) == "numbers") c(3, 1.3) else c(1, 1)
-    return(patchwork::wrap_plots(main, panels[[1]], widths = widths))
+  # a lettered title on every panel ("A. Raincloud plot", "B. Time series", ...): with several panels next to
+  # each other, a title on top of each one is what makes it obvious which axes and tick labels belong together
+  panelTitles <- c(timeSeries = gettext("Time series"), qq = gettext("Q-Q plot"), numbers = gettext("Statistics"))
+  titles <- sprintf("%s. %s", LETTERS[seq_len(nPanels + 1)], c(mainTitle, panelTitles[names(panels)]))
+  main   <- .descriptivesSummaryScaleAddTitle(main, titles[1])
+  panels <- Map(.descriptivesSummaryScaleAddTitle, panels, titles[-1])
+
+  # a margin on every supplementary panel, on every side, so it never sits flush against its neighbour(s)
+  # (main or another panel): without it, pushed edge to edge, it was not obvious which panel's axis a given
+  # tick label belonged to. More on the left, where the y axis title and tick labels sit, the part most easily
+  # mistaken for the right edge of the plot next to it. `main` (a raincloud or a histogram+box patchwork)
+  # already carries its own tuned margins, so it is left alone here rather than risking `&`, which reaches
+  # inside a nested patchwork (a histogram's own internal spacing) and overrides margins already set there.
+  panels <- lapply(panels, function(pnl) pnl + ggplot2::theme(plot.margin = ggplot2::margin(t = 14, r = 10, b = 12, l = 20)))
+  # the numbers panel has no y axis to keep apart, and needs every bit of width for its rows
+  if (!is.null(panels[["numbers"]]))
+    panels[["numbers"]] <- panels[["numbers"]] + ggplot2::theme(plot.margin = ggplot2::margin(t = 14, r = 6, b = 12, l = 12))
+
+  # the numbers panel is a narrow column on the right spanning the full height (like Minitab's summary report):
+  # in a quarter of the image, as a 2 x 2 cell, its ~20 rows of text overlapped each other
+  plots <- panels[names(panels) != "numbers"]
+
+  left <- if (length(plots) == 0) {
+    main
+  } else if (length(plots) == 1 && is.null(panels[["numbers"]])) {
+    patchwork::wrap_plots(main, plots[[1]], widths = c(1, 1))
+  } else if (length(plots) == 1) {
+    patchwork::wrap_plots(main, plots[[1]], ncol = 1)
+  } else {
+    patchwork::wrap_plots(main, patchwork::wrap_plots(plots, ncol = 2), ncol = 1)
   }
 
-  if (nPanels == 2) {
-    below <- patchwork::wrap_plots(panels, ncol = 2)
-    return(patchwork::wrap_plots(main, below, ncol = 1))
+  if (is.null(panels[["numbers"]]))
+    return(left)
+
+  patchwork::wrap_plots(left, panels[["numbers"]], widths = c(3, 1.75))
+}
+
+# Panel title, same small size for every panel. `p` is either a ggplot or (histogram main plot) a patchwork of
+# the histogram above the box: `+` on a patchwork adds to its LAST plot, so the title goes on its first one instead
+.descriptivesSummaryScaleAddTitle <- function(p, title) {
+  titleTheme <- ggplot2::theme(plot.title = ggplot2::element_text(size = 15, hjust = 0.5, margin = ggplot2::margin(b = 6)))
+
+  if (inherits(p, "patchwork")) {
+    p[[1]] <- p[[1]] + ggplot2::ggtitle(title) + titleTheme
+    return(p)
   }
 
-  # 3 panels: 2 x 2
-  patchwork::wrap_plots(c(list(main), panels), ncol = 2)
+  return(p + ggplot2::ggtitle(title) + titleTheme)
 }
 
 # Median, first and third quartile, written next to the box of the main plot
@@ -3187,11 +3425,143 @@ DescriptivesInternal <- function(jaspResults, dataset, options) {
   return(stats::setNames(q, c("q1", "median", "q3")))
 }
 
+# Whisker ends: the most extreme values still within 1.5 * IQR of the box, same rule geom_boxplot draws with
+.descriptivesSummaryScaleWhiskers <- function(variable, q) {
+  valid <- na.omit(variable)
+  iqr   <- q[["q3"]] - q[["q1"]]
+  lo    <- min(valid[valid >= q[["q1"]] - 1.5 * iqr])
+  hi    <- max(valid[valid <= q[["q3"]] + 1.5 * iqr])
+
+  return(stats::setNames(c(lo, hi), c("lo", "hi")))
+}
+
+# How many mm of panel width a label needs, as a function of font size: shared by .descriptivesSummaryScaleFontSize()
+# with everything else that reasons about label size. Measured (via grid::grobWidth() on a textGrob) at ~0.52 *
+# fontSize per digit/"."/"-"; the +0.6 is breathing room between two adjacent labels and does not scale with size.
+.descriptivesSummaryScaleLabelMM <- function(weightedNchar, fontSize) weightedNchar * fontSize * 0.52 + 0.6
+
+# One font size (ggplot2 `size`, mm) for the whole 5-label row (whisker ends, Q1, median, Q3), as big as the
+# row's own tightest adjacent pair allows without those two labels' printed boxes touching. Falls back toward
+# minSize as the values (or the panel) get tighter, but never below it: a pathologically narrow IQR next to
+# long-tailed outliers loses a little size rather than overlapping.
+# A single size (fixed independently of hjust) was the first version; sizing the trio and the two whisker ends
+# independently (the trio big, an end capped only by its own neighbour) was tried next, to let the trio be
+# bigger when a whisker was the tight pair - but that treats the neighbouring quartile's width as if it were
+# already sized down to the (smaller) end size, when it is actually still drawn at the (bigger) trio size, so it
+# quietly undersized the gap it was solving for and could still overlap. One size for the row, chosen against
+# every pair with each label's ACTUAL eventual size, has no such mismatch.
+# `mainWidthPx`: the pixel width actually available to the plot (see .descriptivesSummaryScaleMainWidth);
+# `axisRange`: the span, in data units, that this width is stretched across; `hjust`: length n, see
+# .descriptivesSummaryScaleLabelSizes() - a label hjust'd away from a neighbour (0 or 1) needs only its own full
+# width toward that neighbour and none away from it, instead of half each way like a centred (hjust 0.5) label.
+.descriptivesSummaryScaleFontSize <- function(vals, labelText, hjust, mainWidthPx, axisRange,
+                                              minSize = 3.0, maxSize = 6) {
+  n <- length(vals)
+  if (n < 2) return(maxSize)
+
+  usableWidthMM <- (mainWidthPx / 96) * 25.4 * 0.9  # 96 px/in matches how .descriptivesSummaryScaleSize() sizes plots
+  mmPerUnit     <- usableWidthMM / axisRange
+
+  fits <- sapply(seq_len(n - 1), function(i) {
+    gapMM <- (vals[i + 1] - vals[i]) * mmPerUnit
+    # how much of each label's width actually extends into this gap, towards the other one: all of it (1) if
+    # hjust'd fully that way, none (0) if hjust'd fully the other way, half if centred (hjust 0.5) - hjust 0
+    # means "text grows towards larger values" (share of the left label's width growing right = 1 - hjust),
+    # hjust 1 means "text grows towards smaller values" (share of the right label's width growing left = hjust)
+    share1 <- 1 - hjust[i]
+    share2 <- hjust[i + 1]
+    weightedNchar <- nchar(labelText[i]) * share1 + nchar(labelText[i + 1]) * share2
+    # .descriptivesSummaryScaleLabelMM(weightedNchar, fontSize) == gapMM, solved for fontSize; the 1.15 is a
+    # safety margin, since this solves for the exact touching-boundary size and the width model (~0.52 * size
+    # per character) is an approximation - without it, labels were seen to render just barely touching
+    (gapMM - 0.6) / (weightedNchar * 0.52 * 1.15)
+  })
+
+  return(max(minSize, min(maxSize, fits)))
+}
+
+# One font size and hjust per label of the 5-label row (whisker ends, Q1, median, Q3), so that every label sits
+# exactly on its true value (except as a last resort, see leader lines below) and no two ever touch. Every label starts centred (hjust 0.5, the cheapest option:
+# it only ever needs half its width to compete for a gap, instead of all of it). A whisker end only switches to
+# being hjust'd fully towards its one neighbouring quartile (0 for the low end, 1 for the high end) when staying
+# centred at the fitted size would run it past the axis edge next to it (a whisker sitting very close to that
+# edge - common: it is, after all, the most extreme value in the data - would otherwise be cut off by the panel
+# border, which no font-size limit alone prevents): asymmetric hjust avoids that, but at the cost of needing
+# MORE, not less, room from its neighbouring quartile (the full width of a hjust 0/1 label counts towards that
+# gap, not just half), so it is only worth paying where centring would actually clip.
+# `axisMin`/`axisMax`: the plotted axis range (e.g. range(yBreaks)); see .descriptivesSummaryScaleDeclutter() for
+# `mainWidthPx`/`axisRange`. Every element of the result has length 5, lo/q1/median/q3/hi order.
+#
+# When one row is too crowded (e.g. Q1, median and Q3 within a unit of each other while a long tail stretches
+# the axis), two fallbacks, in this order:
+# - staggered: the labels alternate between two rows, whisker ends and median on row 1, Q1 and Q3 on row 2.
+#   Neighbours on the same row are then two intervals apart instead of one, and every label still sits exactly
+#   on its true value. Used when that gives at least `leaderBelow`; capped at `staggerMax`, since the two rows
+#   only have so much height between the box and the cloud.
+# - leader lines: when even staggering is too tight, one row at a fixed size, each label pushed sideways just
+#   far enough not to touch its neighbours (the least total displacement, see below) and a thin line from it
+#   to its true value.
+# Returns list(text, size, hjust, row, pos, leader): `row` 1 or 2, `pos` where each label is drawn (data units,
+# equal to its true value unless `leader`).
+.descriptivesSummaryScaleLabelSizes <- function(q, w, mainWidthPx, axisRange, axisMin, axisMax,
+                                                staggerBelow = 4, staggerMax = 4.5, leaderBelow = 3.5, leaderSize = 3.5) {
+  vals <- c(w[["lo"]], q, w[["hi"]])
+  text <- sprintf("%.2f", vals)
+
+  usableWidthMM <- (mainWidthPx / 96) * 25.4 * 0.9
+  mmPerUnit     <- usableWidthMM / axisRange
+
+  # the size every row allows, the smallest of them (only labels on the same row can run into each other);
+  # minSize = 0, so a size that does not fit shows as too small instead of being clamped up to look fine
+  fit <- function(row, hjust) {
+    min(sapply(split(seq_len(5), row), function(idx)
+      .descriptivesSummaryScaleFontSize(vals[idx], text[idx], hjust[idx], mainWidthPx, axisRange, minSize = 0)))
+  }
+  # a whisker end hjust'd towards its neighbour when centred it would run past the axis edge
+  clipHjust <- function(size) {
+    halfWidthMM <- function(i) nchar(text[i]) * size * 0.52 / 2
+    c(if (halfWidthMM(1) > (vals[1] - axisMin) * mmPerUnit) 0 else 0.5, 0.5, 0.5, 0.5,
+      if (halfWidthMM(5) > (axisMax - vals[5]) * mmPerUnit) 1 else 0.5)
+  }
+
+  hjust <- rep(0.5, 5)
+  row   <- rep(1, 5)
+  size  <- fit(row, hjust)
+
+  if (size < staggerBelow) {
+    row  <- c(1, 2, 1, 2, 1)
+    size <- min(staggerMax, fit(row, hjust))
+  }
+
+  # only recompute (and only ever get smaller) if centring an end really would have clipped it
+  hjust <- clipHjust(size)
+  if (any(hjust != 0.5)) size <- min(size, fit(row, hjust))
+
+  if (size >= leaderBelow || all(row == 1))
+    return(list(text = text, size = rep(max(3, size), 5), hjust = hjust, row = row, pos = vals, leader = FALSE))
+
+  # leader lines. Label centres (mm along the axis) at least half of both widths apart: with c the cumulative
+  # minimum distance from the first label, centre_i = z_i + c_i for any non-decreasing z keeps them apart, and
+  # the z closest to (true position - c) is the isotonic regression of it - the least total displacement
+  widthMM <- nchar(text) * leaderSize * 0.52 + 1.5
+  c       <- c(0, cumsum((widthMM[-1] + widthMM[-5]) / 2))
+  trueMM  <- (vals - axisMin) * mmPerUnit
+  centre  <- stats::isoreg(seq_len(5), trueMM - c)$yf + c
+
+  # then shifted back inside the axis as a whole, if that pushed one off either end
+  centre <- centre + max(0, widthMM[1] / 2 - centre[1])
+  centre <- centre - max(0, centre[5] + widthMM[5] / 2 - axisRange * mmPerUnit)
+
+  return(list(text = text, size = rep(leaderSize, 5), hjust = rep(0.5, 5), row = rep(1, 5),
+              pos = axisMin + centre / mmPerUnit, leader = TRUE))
+}
+
 # Raincloud plot: density "cloud" + box plot + (optional) raindrops
-.descriptivesSummaryScaleRaincloud <- function(variable, options) {
+.descriptivesSummaryScaleRaincloud <- function(variable, options, mainWidthPx = 576) {
   valid <- na.omit(variable)
   df    <- data.frame(y = valid, x = factor(1))
   q     <- .descriptivesSummaryScaleQuartiles(variable, options)
+  w     <- .descriptivesSummaryScaleWhiskers(variable, q)
   base  <- jaspGraphs::JASPcolors(options[["colorPalette"]])[1]
 
   showDrops <- options[["summaryScaleRaindrops"]]
@@ -3206,39 +3576,84 @@ DescriptivesInternal <- function(jaspResults, dataset, options) {
     ggrain::geom_rain(
       rain.side    = "r",
       violin.args  = list(fill = base, alpha = .6, colour = "black", linewidth = .3),
-      # width = height of the cloud; the nudge is ggrain's default position, it is lost when only the width is given
-      violin.args.pos = list(width = 0.5, position = ggplot2::position_nudge(x = 0.15)),
+      # width = height of the cloud; nudged further out than ggrain's default (0.15) so the box and the cloud
+      # (near edge at the nudge value) leave room for the whisker/quartile label row (see below)
+      violin.args.pos = list(width = 0.5, position = ggplot2::position_nudge(x = 0.27)),
       boxplot.args = list(fill = boxFill, colour = boxColour, outlier.shape = if (showDrops) NA else 19, linewidth = .4),
-      point.args   = list(colour = base, alpha = if (showDrops) .6 else 0, size = 1.5))
+      # nudged slightly less than ggrain's default (0.1) so its top edge (now at x = 1.105) leaves the labels a
+      # little more room to sit close to it without touching
+      boxplot.args.pos = list(width = 0.05, position = ggplot2::position_nudge(x = 0.08)),
+      # the raindrops themselves are drawn separately below, colour-coded by outlier status - geom_rain's own
+      # point layer takes one fixed colour for every point, with no way to map a per-point aesthetic onto it
+      point.args   = list(alpha = 0))
 
-  labs <- data.frame(y = q, label = format(round(q, 2), nsmall = 2), face = c("plain", "bold", "plain"))
-  p <- p + ggplot2::geom_label(data = labs, ggplot2::aes(x = 1.2, y = y, label = label, fontface = face),
-                              size = 3.2, fill = "white", alpha = .8, linewidth = 0, inherit.aes = FALSE)
+  if (showDrops) {
+    pointsDf <- data.frame(x = factor(1), y = valid, outlier = valid < w[["lo"]] | valid > w[["hi"]])
+    # same jitter as ggrain's own default (position_jitter(width = 0.04, height = 0, seed = 42)) so these land
+    # exactly where its (now invisible) points would have
+    p <- p +
+      ggplot2::geom_point(data = pointsDf, ggplot2::aes(x = x, y = y, colour = outlier),
+                          position = ggplot2::position_jitter(width = 0.04, height = 0, seed = 42),
+                          alpha = .6, size = 1.5, show.legend = FALSE) +
+      ggplot2::scale_colour_manual(values = c(`FALSE` = base, `TRUE` = "#D55E00"))
+  }
 
   # breaks that cover the whole range of the data (after coord_flip() the values are still on the y scale)
   yBreaks <- jaspGraphs::getPrettyAxisBreaks(valid)
+
+  # placed in the gap between the box and the cloud, not on top of either, all on one row (level with each
+  # other) and each exactly on its true value; see .descriptivesSummaryScaleLabelSizes() for how big each one
+  # is allowed to be.
+  axisRange <- diff(range(yBreaks))
+  sizes <- .descriptivesSummaryScaleLabelSizes(q, w, mainWidthPx, axisRange, min(yBreaks), max(yBreaks))
+  # still hjust, even under coord_flip(): coord_flip() remaps which data aesthetic renders in which screen
+  # direction, but it does not rotate the text itself, and hjust/vjust are about the text's OWN (never-rotated)
+  # width/height - hjust is still "horizontal on screen" regardless of which data aesthetic is mapped there.
+  # Using vjust here first (on the theory that y, the data/value aesthetic, becomes the screen-horizontal one so
+  # its justification parameter should too) was tried and shipped, but vjust turned out to shift the label onto
+  # a different row instead - a labelled reference line confirmed hjust is the one that behaves as intended.
+  # one row at 1.16; staggered (see .descriptivesSummaryScaleLabelSizes()), row 1 just above the box and row 2
+  # just under the cloud; with leader lines, one row a little higher, the lines in the space under it
+  rowX  <- if (sizes$leader) 1.19 else if (all(sizes$row == 1)) 1.16 else c(1.14, 1.215)[sizes$row]
+  labs  <- data.frame(x = rowX, y = sizes$pos, value = c(w[["lo"]], q, w[["hi"]]), label = sizes$text,
+                      size = sizes$size, hjust = sizes$hjust, face = c("plain", "plain", "bold", "plain", "plain"))
+  if (sizes$leader)
+    p <- p + ggplot2::geom_segment(data = labs, ggplot2::aes(x = 1.11, xend = 1.165, y = value, yend = y),
+                                   colour = "grey50", linewidth = .3, inherit.aes = FALSE)
+  p <- p + ggplot2::geom_label(data = labs,
+                               ggplot2::aes(x = x, y = y, label = label, size = size, hjust = hjust, fontface = face),
+                               fill = "white", alpha = .8, linewidth = 0, inherit.aes = FALSE) +
+    ggplot2::scale_size_identity()
 
   # the small expansions matter: coord_flip(xlim) takes its padding from the scales, without them a big empty band
   # appears under the raindrops
   p <- p +
     ggplot2::scale_x_discrete(expand = ggplot2::expansion(add = c(0.02, 0.02))) +
     ggplot2::scale_y_continuous(breaks = yBreaks, limits = range(yBreaks), expand = ggplot2::expansion(mult = 0.02)) +
-    # lower limit: the space under the box is only needed for the raindrops
-    ggplot2::coord_flip(xlim = c(if (showDrops) 0.92 else 1.05, 1.4)) +
+    # lower limit: the space under the box is only needed for the raindrops; upper limit matches the cloud's far
+    # edge; clip = "off" so a whisker label whose true value sits right at the axis edge (a common way for an
+    # otherwise-unremarkable variable to look, not a rare edge case) is not itself cut off by the panel border
+    ggplot2::coord_flip(xlim = c(if (showDrops) 0.92 else 1.05, 1.54), clip = "off") +
     ggplot2::labs(x = NULL, y = NULL) +
     jaspGraphs::geom_rangeframe(sides = "b") +
     jaspGraphs::themeJaspRaw() +
-    ggplot2::theme(axis.text.y = ggplot2::element_blank(), axis.ticks.y = ggplot2::element_blank())
+    # left/right margin: themeJaspRaw()'s default is 0, so with nothing here the two end tick labels on the
+    # value axis (e.g. "-1.0") have nowhere to draw their other half into and get clipped by the image edge -
+    # the same problem .descriptivesSummaryScaleLabelSizes()'s hjust switch solves for the whisker labels, but
+    # for axis tick labels (drawn by ggplot2 itself, not by us) a margin is the only lever available
+    ggplot2::theme(axis.text.y = ggplot2::element_blank(), axis.ticks.y = ggplot2::element_blank(),
+                   plot.margin = ggplot2::margin(l = 14, r = 14, t = 2, b = 2))
 
   return(p)
 }
 
 # Histogram (Minitab style): histogram on top (optional density line), box plot below with the same x axis and
-# median / Q1 / Q3 written under the box
-.descriptivesSummaryScaleHistogram <- function(variable, options) {
+# whisker ends / median / Q1 / Q3 written above the box
+.descriptivesSummaryScaleHistogram <- function(variable, options, mainWidthPx = 576) {
   valid  <- variable[!is.na(variable)]
   base   <- jaspGraphs::JASPcolors(options[["colorPalette"]])[1]
   q      <- .descriptivesSummaryScaleQuartiles(variable, options)
+  w      <- .descriptivesSummaryScaleWhiskers(variable, q)
   breaks <- jaspGraphs::getPrettyAxisBreaks(valid)
 
   h <- jaspGraphs::jaspHistogram(valid, xName = "", binWidthType = "sturges",
@@ -3250,16 +3665,25 @@ DescriptivesInternal <- function(jaspResults, dataset, options) {
     ggplot2::scale_x_continuous(breaks = breaks, limits = range(breaks), expand = ggplot2::expansion(mult = 0.02)) +
     ggplot2::theme(axis.title.x = ggplot2::element_blank())
 
-  iqr <- q[["q3"]] - q[["q1"]]
-  lo  <- min(valid[valid >= q[["q1"]] - 1.5 * iqr])
-  hi  <- max(valid[valid <= q[["q3"]] + 1.5 * iqr])
-  out <- data.frame(x = valid[valid < lo | valid > hi])
-  box <- data.frame(xmin = lo, xlower = q[["q1"]], xmiddle = q[["median"]],
-                    xupper = q[["q3"]], xmax = hi, y = 0)
-  labs <- data.frame(x = q, label = format(round(q, 2), nsmall = 2), face = c("plain", "bold", "plain"))
+  out <- data.frame(x = valid[valid < w[["lo"]] | valid > w[["hi"]]])
+  box <- data.frame(xmin = w[["lo"]], xlower = q[["q1"]], xmiddle = q[["median"]],
+                    xupper = q[["q3"]], xmax = w[["hi"]], y = 0)
 
   boxFill   <- grDevices::colorRampPalette(c(base, "white"))(11)[7]
   boxColour <- grDevices::colorRampPalette(c(base, "black"))(11)[5]
+
+  # ggrepel does not belong here either (see .descriptivesSummaryScaleLabelSizes()'s comment): with every label
+  # on the same row and only its x varying, it was seen to both overlap labels AND drift them from their true
+  # value even though nothing here needs any repelling. Spread apart by hand instead, all on one row (level with
+  # each other) and each exactly on its true value; see .descriptivesSummaryScaleLabelSizes() for how big each
+  # one is allowed to be.
+  axisRange <- diff(range(breaks))
+  sizes <- .descriptivesSummaryScaleLabelSizes(q, w, mainWidthPx, axisRange, min(breaks), max(breaks))
+  # staggered (see .descriptivesSummaryScaleLabelSizes()): row 2 above row 1, still under the top limit; with
+  # leader lines, one row a little higher, the lines in the space under it
+  labs  <- data.frame(x = sizes$pos, value = c(w[["lo"]], q, w[["hi"]]),
+                      y = if (sizes$leader) 0.55 else c(0.34, 0.7)[sizes$row], label = sizes$text, size = sizes$size,
+                      hjust = sizes$hjust, face = c("plain", "plain", "bold", "plain", "plain"))
 
   b <- ggplot2::ggplot() +
     ggplot2::geom_boxplot(data = box,
@@ -3267,49 +3691,163 @@ DescriptivesInternal <- function(jaspResults, dataset, options) {
                           stat = "identity", orientation = "y", fill = boxFill, colour = boxColour,
                           linewidth = .4, width = .5) +
     ggplot2::geom_point(data = out, ggplot2::aes(x = x, y = 0), colour = boxColour, size = 1.2) +
-    ggplot2::geom_text(data = labs, ggplot2::aes(x = x, y = -0.42, label = label, fontface = face),
-                       size = 3.2, vjust = 1) +
+    (if (sizes$leader) ggplot2::geom_segment(data = labs, ggplot2::aes(x = value, xend = x, y = 0.27, yend = 0.5),
+                                             colour = "grey50", linewidth = .3)) +
+    ggplot2::geom_text(data = labs,
+                       ggplot2::aes(x = x, y = y, label = label, size = size, hjust = hjust, fontface = face),
+                       vjust = 0) +
+    ggplot2::scale_size_identity() +
     ggplot2::scale_x_continuous(breaks = breaks, limits = range(breaks), expand = ggplot2::expansion(mult = 0.02)) +
-    ggplot2::scale_y_continuous(limits = c(-0.85, 0.35)) +
+    ggplot2::scale_y_continuous(limits = c(-0.35, if (any(sizes$row == 2)) 1.15 else if (sizes$leader) 1.0 else 0.85)) +
+    # a whisker label whose true value sits right at the axis edge (a common way for an otherwise-unremarkable
+    # variable to look, not a rare edge case) would otherwise be cut off by the panel border
+    ggplot2::coord_cartesian(clip = "off") +
     ggplot2::labs(x = NULL, y = NULL) +
     jaspGraphs::themeJaspRaw() +
+    # the top margin is real whitespace, not data-space padding, and is what actually creates the gap from the
+    # histogram above: patchwork stacks the two panels with no gap of its own (both plots' default plot.margin
+    # is 0), and padding out scale_y_continuous()'s limits instead does not touch that shared border at all
     ggplot2::theme(axis.text.x = ggplot2::element_blank(), axis.text.y = ggplot2::element_blank(),
                    axis.ticks.x = ggplot2::element_blank(), axis.ticks.y = ggplot2::element_blank(),
-                   axis.line.x = ggplot2::element_blank(), axis.line.y = ggplot2::element_blank())
+                   axis.line.x = ggplot2::element_blank(), axis.line.y = ggplot2::element_blank(),
+                   plot.margin = ggplot2::margin(t = 8))
 
-  return(patchwork::wrap_plots(h, b, ncol = 1, heights = c(4, 1.3)))
+  # a taller box panel when the labels take two rows, or the rows sit on top of each other
+  return(patchwork::wrap_plots(h, b, ncol = 1, heights = c(4, if (any(sizes$row == 2)) 2.4 else 1.6)))
 }
 
-# Q-Q plot with a 95% CI band (always on)
-.descriptivesSummaryScaleQQ <- function(variable, options) {
-  z    <- as.numeric(scale(na.omit(variable)))
+# Q-Q plot of the standardized values with a 95% reference envelope (always on): where the points are expected to
+# fall if the variable were normal. Computed as in the Distributions module (.ldFillQQPlot in jaspDistributions):
+# Fox, J. (2016). Applied Regression Analysis and Generalized Linear Models (3rd ed.), Section 3.1.3.
+# NOTE: not jaspGraphs::plotQQnorm(), its band is centred on the line through the sample quartiles (qqline), not
+#       on the y = x reference line it draws, so with skewed data the reference line leaves its own band.
+.descriptivesSummaryScaleQQ <- function(variable, options, ciLevel = 0.95) {
+  z    <- sort(as.numeric(scale(na.omit(variable))))
+  n    <- length(z)
+  p    <- stats::ppoints(n)
   base <- jaspGraphs::JASPcolors(options[["colorPalette"]])[1]
 
-  jaspGraphs::plotQQnorm(z,
-                         yName = gettext("Sample quantiles"),
-                         ablineColor = "darkred",
-                         ablineOrigin = TRUE,
-                         identicalAxes = FALSE,
-                         ciLevel = 0.95,
-                         fillColor = base)
+  # theoretical quantiles of the fitted normal; z is standardized, so that is the standard normal
+  theoretical <- stats::qnorm(p)
+  slope       <- stats::coef(stats::lm(z ~ theoretical))[[2]]
+
+  # standard error of the i-th order statistic, the envelope is centred on the reference line y = x
+  se   <- sqrt(p * (1 - p) / n) * slope / stats::dnorm(theoretical)
+  crit <- stats::qnorm((1 - ciLevel) / 2, lower.tail = FALSE)
+  df   <- data.frame(theoretical = theoretical, sample = z,
+                     lower = theoretical - crit * se, upper = theoretical + crit * se)
+
+  xBreaks <- jaspGraphs::getPrettyAxisBreaks(theoretical)
+  yBreaks <- jaspGraphs::getPrettyAxisBreaks(c(z, df$lower, df$upper))
+
+  ggplot2::ggplot(df, ggplot2::aes(x = theoretical)) +
+    ggplot2::geom_ribbon(ggplot2::aes(ymin = lower, ymax = upper), fill = base, alpha = .25) +
+    ggplot2::geom_line(ggplot2::aes(y = theoretical), colour = "darkred", linewidth = 1) +
+    jaspGraphs::geom_point(ggplot2::aes(y = sample)) +
+    ggplot2::scale_x_continuous(name = gettext("Theoretical quantiles"), breaks = xBreaks, limits = range(xBreaks)) +
+    ggplot2::scale_y_continuous(name = gettext("Sample quantiles"), breaks = yBreaks, limits = range(yBreaks)) +
+    jaspGraphs::geom_rangeframe() + jaspGraphs::themeJaspRaw()
 }
 
 # Time series: the values plotted against the row order
-.descriptivesSummaryScaleTimeSeries <- function(variable, options) {
-  df <- data.frame(t = seq_along(variable), y = variable)
-  base <- jaspGraphs::JASPcolors(options[["colorPalette"]])[1]
+# `rowNumbers`: the row numbers of `variable` in the JASP data, row.names(dataset). JASP keeps these as the
+# original (unfiltered) row numbers when a filter is active (see rbridge_readDataSet() in jasp-desktop), so the
+# x axis and the outlier labels point at the row the user sees in the data view, filtered or not.
+.descriptivesSummaryScaleTimeSeries <- function(variable, options, variableName, rowNumbers = seq_along(variable)) {
+  n    <- length(variable)
+  tMax <- max(rowNumbers)
+  q    <- .descriptivesSummaryScaleQuartiles(variable, options)
+  w    <- .descriptivesSummaryScaleWhiskers(variable, q)
+  # outliers by the same 1.5 * IQR rule, and in the same colour, as in the raincloud: there it shows how many
+  # there are, here when they happened (all in one stretch hints at a data entry problem or a changed setting)
+  df <- data.frame(t = rowNumbers, y = variable, outlier = variable < w[["lo"]] | variable > w[["hi"]])
+  outlierColour <- "#D55E00"
 
-  p <- ggplot2::ggplot(df, ggplot2::aes(x = t, y = y)) +
-    ggplot2::geom_line(colour = base, linewidth = .4, na.rm = FALSE) +
-    ggplot2::geom_point(colour = base, size = 1, na.rm = TRUE)
-  
+  # How it is drawn depends on n, since the panel is only ~400 px wide (see .descriptivesSummaryScaleSize()):
+  # - n <= 100: same look as the other JASP line plots, thin black line, grey points with a black border
+  # - 100 < n <= 500: the points would overlap at full size, so they (and the line) shrink with n
+  # - n > 500: several observations per pixel, points only add ink and the line turns into a solid band that
+  #   shows the range but no trend: a thin light line only, with a running median on top, so a drift or a jump
+  #   is still visible; only the outliers are still drawn as points (there are few of them, by definition)
+  # A missing value leaves a gap in the line (na.rm only silences the warning, geom_line still breaks at an NA)
+  # "Show dots" off: the line(s) only, no points at all (the outliers keep their row number labels)
+  showDots <- isTRUE(options[["summaryScaleTimeSeriesDots"]])
+
+  p <- ggplot2::ggplot(df, ggplot2::aes(x = t, y = y))
+
+  if (n <= 500) {
+    pointSize <- if (n <= 100) 2.5 else 2.5 * sqrt(100 / n)
+    # the line thins faster than the points (with 100 / n, not sqrt(100 / n)): with many points a line as thick
+    # as at n = 100 turns the plot into a dark scribble. Never below .12, the width of the n > 500 line, so the
+    # width does not jump at n = 501
+    lineWidth <- max(.12, .4 * min(1, 100 / n))
+    p <- p + ggplot2::geom_line(colour = "black", linewidth = lineWidth, na.rm = TRUE)
+    if (showDots)
+      p <- p +
+        ggplot2::geom_point(ggplot2::aes(fill = outlier), shape = 21, colour = "black", size = pointSize,
+                            stroke = .4 * pointSize / 2.5, na.rm = TRUE, show.legend = FALSE) +
+        ggplot2::scale_fill_manual(values = c(`FALSE` = "grey", `TRUE` = outlierColour))
+  } else {
+    # runmed() takes no NAs and an odd window; the window (~n/20) is wide enough to smooth out single values but
+    # narrow enough to keep a jump a jump. The median, not the mean, so a few outliers do not pull it around
+    valid <- df[!is.na(df$y), ]
+    k     <- max(3, 2 * floor(nrow(valid) / 40) + 1)
+    valid$trend <- stats::runmed(valid$y, k = k, endrule = "median")
+
+    p <- p +
+      ggplot2::geom_line(colour = "grey60", linewidth = .12, na.rm = TRUE) +
+      ggplot2::geom_line(data = valid, ggplot2::aes(x = t, y = trend),
+                         colour = jaspGraphs::JASPcolors(options[["colorPalette"]])[1], linewidth = 1)
+    if (showDots)
+      p <- p + ggplot2::geom_point(data = valid[valid$outlier, ], shape = 21, fill = outlierColour, colour = "black",
+                                   size = 1.5, stroke = .3)
+  }
+
+  # each outlier labelled with its row number, so it can be looked up in the data: above the point for a high
+  # one, below for a low one (above, it would sit on the line). At most `maxLabels`, the ones furthest from the
+  # median, or the labels pile up into an unreadable block; the subtitle says so when not all are labelled
+  maxLabels <- 10
+  outliers  <- df[!is.na(df$outlier) & df$outlier, ]
+  outliers  <- outliers[order(abs(outliers$y - q[["median"]]), decreasing = TRUE), ]
+  nOutliers <- nrow(outliers)
+  labelled  <- outliers[seq_len(min(nOutliers, maxLabels)), ]
+  labelled$high <- labelled$y > q[["median"]]
+
   yBreaks <- jaspGraphs::getPrettyAxisBreaks(na.omit(variable))
-  tBreaks <- jaspGraphs::getPrettyAxisBreaks(df$t)
+  nudge   <- diff(range(yBreaks)) * .06
 
-  p <- p +  
-      ggplot2::scale_x_continuous(breaks = tBreaks, limits = range(tBreaks)) +
-      ggplot2::scale_y_continuous(breaks = yBreaks, limits = range(yBreaks)) +
-      ggplot2::labs(x = gettext("Observation (row order)"), y = NULL) +
+  for (high in c(TRUE, FALSE)) {
+    side <- labelled[labelled$high == high, ]
+    if (nrow(side) == 0)
+      next
+    p <- p + ggrepel::geom_text_repel(data = side, ggplot2::aes(x = t, y = y, label = t),
+                                      nudge_y = if (high) nudge else -nudge, size = 3.5, colour = outlierColour,
+                                      segment.colour = "grey50", segment.size = .3, min.segment.length = .2,
+                                      box.padding = .15, point.padding = .1, seed = 1, max.overlaps = Inf)
+  }
+
+  if (nOutliers > maxLabels)
+    p <- p + ggplot2::labs(subtitle = gettextf("Row numbers of the %1$i most extreme of %2$i outliers", maxLabels, nOutliers)) +
+      ggplot2::theme(plot.subtitle = ggplot2::element_text(size = 12, hjust = 0.5, margin = ggplot2::margin(b = 4)))
+
+  # the axis ends exactly at the last row (the number of observations, without a filter), not at the next pretty
+  # number beyond it (which left an empty band on the right): tMax is always the last break, the pretty break
+  # just before it is dropped when it is too close to tMax for both labels to fit
+  tBreaks <- pretty(c(0, tMax), n = 4)
+  tBreaks <- tBreaks[tBreaks < tMax]
+  if (length(tBreaks) > 1 && tMax - tBreaks[length(tBreaks)] < (tBreaks[2] - tBreaks[1]) / 2)
+    tBreaks <- tBreaks[-length(tBreaks)]
+  tBreaks <- c(tBreaks, tMax)
+
+  p <- p +
+      ggplot2::scale_x_continuous(breaks = tBreaks, limits = c(0, tMax)) +
+      # room above (below) the highest (lowest) break for a label nudged up (down): a label pushed past the
+      # limits is dropped by ggplot2 altogether, not just clipped, and the most extreme outlier is the one most
+      # likely to sit right at the edge
+      ggplot2::scale_y_continuous(breaks = yBreaks,
+                                  limits = range(yBreaks) + c(if (any(!labelled$high)) -2 * nudge else 0,
+                                                              if (any(labelled$high))  2 * nudge else 0)) +
+      ggplot2::labs(x = gettext("Row number"), y = variableName) +
       jaspGraphs::geom_rangeframe() + jaspGraphs::themeJaspRaw()
 
   return(p)
@@ -3327,30 +3865,82 @@ DescriptivesInternal <- function(jaspResults, dataset, options) {
   ordQuantile <- function(p) quantile(valid, p, names = FALSE, type = as.integer(options[["quantilesType"]]))
 
   # 3 decimals like the main table; "-" when a statistic cannot be computed (e.g. kurtosis needs at least 4 values)
-  fmt <- function(x) if (is.finite(x)) sprintf("%.3f", x) else "-"
+  fmt  <- function(x) if (is.finite(x)) sprintf("%.3f", x) else "-"
+  fmtP <- function(p) if (!is.finite(p)) "-" else if (p < .001) "< .001" else sprintf("%.3f", p)
 
+  # same as the main table: shapiro.test() refuses fewer than 3 or more than 5000 values, and all-identical
+  # values, so any error just means "-"
+  shapiro <- try(stats::shapiro.test(valid), silent = TRUE)
+  swW <- if (isTryError(shapiro)) NaN else shapiro$statistic[[1]]
+  swP <- if (isTryError(shapiro)) NaN else shapiro$p.value
+
+  # the 95% CI on the same row, after the estimate, e.g. "43.922 [43.341, 44.503]"; a subtitle (under the panel
+  # title added by .descriptivesSummaryScaleLayout()) says what the brackets are: a "(95% CI)" in the label
+  # itself made the row too wide for the panel
+  ci <- .descriptivesSummaryScaleCIs(valid)
+  withCI <- function(est, ci) if (all(is.finite(ci))) sprintf("%s [%.3f, %.3f]", fmt(est), ci[1], ci[2]) else fmt(est)
+
+  # no minimum and maximum: the raincloud and the histogram already show the range on their axis
   rows <- data.frame(
-    group = c(1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 4, 4, 4),
+    group = c(1, 1, 1, 1, 2, 2, 3, 3, 3, 3, 4, 4, 4),
+    # "p-value" right under the Shapiro-Wilk statistic it belongs to, instead of "P-value of Shapiro-Wilk":
+    # shorter, so it does not run into its value in the narrow panel
     label = c(gettext("Total N"), gettext("Valid N"), gettext("Missing N"), gettext("Valid %"),
-              gettext("Mean"), gettext("Std. Deviation"),
-              gettext("Skewness"), gettext("Kurtosis"),
-              gettext("Minimum"), gettext("25% quantile"), gettext("Median"), gettext("75% quantile"), gettext("Maximum")),
+              # "SD", not "Std. Deviation": the longest label, with "5.460 [5.079, 5.903]" after it, made the panel
+              # column wide enough to squeeze the plots next to it
+              gettext("Mean"), gettext("SD"),
+              gettext("Skewness"), gettext("Kurtosis"), gettext("Shapiro-Wilk"), gettext("p-value"),
+              gettext("25% quantile"), gettext("Median"), gettext("75% quantile")),
 
     value = c(nTotal, nValid, nMissing, sprintf("%.1f%%", nValid / nTotal * 100),
-              fmt(mean(valid)), fmt(sd(valid)),
-              fmt(.descriptivesSkewness(valid)), fmt(.descriptivesKurtosis(valid)),
-              fmt(min(valid)), fmt(ordQuantile(0.25)), fmt(ordQuantile(0.5)), fmt(ordQuantile(0.75)), fmt(max(valid))),
+              withCI(mean(valid), ci[["mean"]]), withCI(sd(valid), ci[["sd"]]),
+              fmt(.descriptivesSkewness(valid)), fmt(.descriptivesKurtosis(valid)), fmt(swW), fmtP(swP),
+              fmt(ordQuantile(0.25)), withCI(ordQuantile(0.5), ci[["median"]]), fmt(ordQuantile(0.75))),
     stringsAsFactors = FALSE
   )
 
-  return(.descriptivesSummaryPanelDraw(rows))
+  # bigger than the default: the panel is a full-height column here, at the default size the rows looked lost
+  # in the space between them
+  p <- .descriptivesSummaryPanelDraw(rows, textSize = 4.5) +
+    ggplot2::labs(subtitle = gettext("[ ] = 95% CI")) +
+    ggplot2::theme(plot.subtitle = ggplot2::element_text(size = 12, hjust = 0.5, margin = ggplot2::margin(b = 4)))
+
+  return(p)
+}
+
+# 95% CIs for the numbers panel, same three as Minitab's summary report. Fixed at 95% and computed here rather
+# than with .descriptivesMeanCI() / .descriptivesSdCI(), which follow the main table's own CI options (level,
+# method, bootstrap): the summary plot should not change when those are changed.
+# - mean: t interval; sd: chi-square interval (as the main table's "chiSquaredModel"); both need n >= 2
+# - median: distribution-free, from the order statistics (sign test), so its coverage is at least 95% rather
+#   than exactly; needs n >= 6, below that even [min, max] covers less than 95%
+# NA where an interval cannot be computed.
+.descriptivesSummaryScaleCIs <- function(valid) {
+  n  <- length(valid)
+  na <- c(NA_real_, NA_real_)
+
+  if (n < 2 || stats::sd(valid) == 0)
+    return(list(mean = na, sd = na, median = na))
+
+  m  <- mean(valid)
+  s  <- stats::sd(valid)
+  meanCI <- m + c(-1, 1) * stats::qt(.975, df = n - 1) * s / sqrt(n)
+  sdCI   <- sqrt((n - 1) * s^2 / stats::qchisq(c(.975, .025), df = n - 1))
+
+  # smallest l with P(Bin(n, .5) <= l) >= .025, so P(X(l) <= median <= X(n - l + 1)) >= .95
+  l <- stats::qbinom(.025, n, .5)
+  sorted   <- sort(valid)
+  medianCI <- if (l >= 1) sorted[c(l, n - l + 1)] else na
+
+  return(list(mean = meanCI, sd = sdCI, median = medianCI))
 }
 
 # Draws a "label | value" panel with separator lines between the groups. Shared by the panels of all three blocks.
-# `rows` is a data.frame with the columns group (1, 2, ...), label and value (both character).
+# `rows` is a data.frame with the columns group (1, 2, ...), label and value (both character); `textSize` is the
+# ggplot2 `size` (mm) of both columns.
 # TODO: make .descriptivesSummaryNominalPanel() and .descriptivesSummaryOrdinalPanel() use this too,
 #       they still contain the same drawing code.
-.descriptivesSummaryPanelDraw <- function(rows) {
+.descriptivesSummaryPanelDraw <- function(rows, textSize = 3.5) {
   rows$y <- -(seq_len(nrow(rows)) + (rows$group - 1) * 0.6)
 
   # a separator below every group except the last one
@@ -3358,10 +3948,11 @@ DescriptivesInternal <- function(jaspResults, dataset, options) {
   seps <- seps[-length(seps)] - 0.6
 
   ggplot2::ggplot() +
-    ggplot2::geom_text(data = rows, ggplot2::aes(x = 0, y = y, label = label), hjust = 0, size = 3.5, fontface = "bold") +
-    ggplot2::geom_text(data = rows, ggplot2::aes(x = 1, y = y, label = value), hjust = 1, size = 3.5) +
+    ggplot2::geom_text(data = rows, ggplot2::aes(x = 0, y = y, label = label), hjust = 0, size = textSize, fontface = "bold") +
+    ggplot2::geom_text(data = rows, ggplot2::aes(x = 1, y = y, label = value), hjust = 1, size = textSize) +
     ggplot2::geom_hline(yintercept = seps, linewidth = .3) +
-    ggplot2::scale_x_continuous(limits = c(-0.1, 1.1)) +
+    # little horizontal padding: the scale panel's rows ("43.922 [43.341, 44.503]") need nearly the full width
+    ggplot2::scale_x_continuous(limits = c(-0.04, 1.04)) +
     ggplot2::scale_y_continuous(limits = c(min(rows$y) - 0.7, max(rows$y) + 0.7)) +
     ggplot2::theme_void() +
     ggplot2::theme(panel.border = ggplot2::element_rect(colour = "black", fill = NA, linewidth = .3))
